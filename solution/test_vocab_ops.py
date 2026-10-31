@@ -148,6 +148,46 @@ def test_entropy_large_logit_offsets(dtype, offset):
     )
 
 
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("offset", [-1000.0, 1000.0])
+@pytest.mark.parametrize("strided", [False, True])
+def test_entropy_fp16_uniform_metric_precision(device, offset, strided):
+    from solution.vocab_ops import entropy_from_logits
+
+    # Uniform logits reproduce correlated FP16 rounding without depending on
+    # a device's RNG. A strided vocabulary also exercises the early fallback.
+    storage = torch.full((3, 8206 if strided else 4103), offset,
+                         device=device, dtype=torch.float16, requires_grad=True)
+    logits = storage[:, ::2] if strided else storage
+    original = logits.detach().clone()
+    with torch.no_grad():
+        actual = entropy_from_logits(logits)
+        expected = _reference_entropy(logits.float())
+    assert actual.dtype == logits.dtype
+    assert not actual.requires_grad
+    torch.testing.assert_close(actual.float(), expected, rtol=3e-5, atol=5e-3)
+    torch.testing.assert_close(logits.detach(), original, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", ["cpu", pytest.param("cuda", marks=requires_cuda)])
+@pytest.mark.parametrize("offset", [-1000.0, 1000.0])
+def test_entropy_fp16_offset_autograd_stays_native(device, offset):
+    from solution.vocab_ops import entropy_from_logits
+
+    torch.manual_seed(67)
+    logits = (torch.randn((3, 4103), device=device, dtype=torch.float16)
+              + offset).requires_grad_()
+    reference_logits = logits.detach().clone().requires_grad_()
+    actual = entropy_from_logits(logits)
+    expected = _reference_entropy(reference_logits)
+    assert actual.dtype == expected.dtype == torch.float16
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    upstream = torch.randn_like(actual)
+    actual.backward(upstream)
+    expected.backward(upstream)
+    torch.testing.assert_close(logits.grad, reference_logits.grad, rtol=0, atol=0)
+
+
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 def test_entropy_preserves_autograd(dtype):
