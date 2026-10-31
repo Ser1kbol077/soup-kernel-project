@@ -1,5 +1,9 @@
 # Second optimization stage: implementation and validation boundary
 
+Check-4 follow-up: the team confirmed that the measured 2.4% / 9-of-10 PASS run
+used `6b175fb`. This second stage (`b7d39a8`) remains unmeasured. The next candidate
+adds a real MLP backward GEMM; see [CHECK4.md](CHECK4.md).
+
 This stage targets large activation buffers and repeated pointwise/reduction
 work while keeping the fixed Soup 0.77.0 task. The model architecture, weights,
 data and batch order, LoRA configuration and dropout, optimizer, scheduler,
