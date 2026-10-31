@@ -13,8 +13,9 @@ The rules in short (the README and the task statement have the full ones):
   settings and outputs; no other GPU, no background processes, no tricks with the measurement.
 """
 
-from .swiglu import patch_qwen2_mlp
-
-
 def apply():
+    from .patches import patch_vocab_operations
+    from .swiglu import patch_qwen2_mlp
+
+    patch_vocab_operations()
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel

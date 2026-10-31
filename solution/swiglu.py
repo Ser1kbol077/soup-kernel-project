@@ -71,6 +71,8 @@ def patch_qwen2_mlp():
     from transformers.models.qwen2 import modeling_qwen2
 
     original = modeling_qwen2.Qwen2MLP.forward
+    if getattr(original, "_soup_example_patch", False):
+        return
 
     def forward(self, x):
         act = getattr(getattr(self, "config", None), "hidden_act", "silu")
@@ -78,4 +80,5 @@ def patch_qwen2_mlp():
             return original(self, x)
         return self.down_proj(swiglu(self.gate_proj(x), self.up_proj(x)))
 
+    forward._soup_example_patch = True
     modeling_qwen2.Qwen2MLP.forward = forward
