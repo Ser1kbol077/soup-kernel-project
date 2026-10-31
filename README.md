@@ -3,11 +3,14 @@
 Первая версия оптимизации обучения **Qwen2.5-1.5B-Instruct на Kaggle Tesla T4** для
 Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-кернелы.
 
-Текущий кандидат для **check 4** заменяет реальный input-gradient GEMM трёх
-замороженных NF4 MLP-проекций собственным `mlp_input_grad_kernel`. Цель — ≥6%
-суммарного времени собственных кернелов. На `6b175fb` измерено 2.4% и 9/10 PASS;
-`b7d39a8` и этот новый кандидат ещё не проверены на T4.
-Выбор операции, guards и план проверки: [solution/CHECK4.md](solution/CHECK4.md).
+В `3351e4b` оба solution-run на T4 завершились с ошибкой; traceback пока
+недоступен. При аудите найден дефект dispatch: Triton 3.6.0 переводит обычный
+`tl.dot` на SM75 в FMA вместо Tensor Core MMA. Исправление сохраняет native
+bitsandbytes backward на T4; собственный MLP GEMM допускается только на SM80+.
+Это не подтверждение причины падения или успешного повторного обучения.
+Разбор и проверки: [solution/SM75_AUDIT.md](solution/SM75_AUDIT.md).
+Цель ≥6% остаётся неподтверждённой. На `6b175fb` измерено 2.4% и 9/10 PASS.
+История кандидата: [solution/CHECK4.md](solution/CHECK4.md).
 
 Новая версия добавляет FP32 loss без полной FP32-копии logits, пропуск ignored
 строк в CE, оригинальный fused RMSNorm и lossless FP16-кэш активаций SwiGLU.
@@ -18,8 +21,9 @@ Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-ке
 запуска; прирост новой версии и все 10 правил требуют повторного измерения.
 
 **Статус: подготовлено к тестированию на T4. Корректность на GPU, ускорение, снижение
-памяти и прохождение всех правил пока НЕ подтверждены.** Локально: Windows,
-Python 3.14, RTX 3050 4 ГБ, без PyTorch/Triton/pytest.
+памяти и прохождение всех правил пока НЕ подтверждены.** Локально доступна
+изолированная CPU-среда и Windows-сборка Triton для compile-only проверки SM75;
+обучение и GPU-тесты на T4 в ней не выполняются.
 Публичный Kaggle notebook пока не опубликован. После Save & Run All его ссылку
 нужно внести сюда и в [SUBMISSION.md](SUBMISSION.md).
 
@@ -45,7 +49,7 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `vocab_entropy_finalize_kernel` | Энтропия через partition function и первый момент |
 | `rmsnorm_row_forward_kernel` | Нормализация и масштабирование frozen FP32 RMSNorm |
 | `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
-| `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для настоящего MLP backward |
+| `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для MLP backward только на SM80+; на T4 native |
 
 Код написан самостоятельно: [solution/vocab_ops.py](solution/vocab_ops.py).
 FP32-редукции и сдвинутые экспоненты обеспечивают численную устойчивость.

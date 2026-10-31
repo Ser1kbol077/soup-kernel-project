@@ -3,6 +3,8 @@
 Pinned contract: bitsandbytes 0.50.2 MatMul4Bit.backward computes dX = dY @ W
 after its native dequantize_4bit. The forward, weight decode, LoRA parameters,
 dropout, bias gradients and original cast boundaries are preserved.
+T4 retains the original backward: Triton 3.6.0 lowers ordinary tl.dot to FMA
+below SM80 instead of the Tensor Core instructions required by this GEMM.
 """
 
 from functools import wraps
@@ -23,6 +25,8 @@ def _eligible_context(ctx, grad_output):
             or grad_output.numel() == 0 or getattr(ctx, "is_empty", True)
             or getattr(ctx, "dtype_A", None) not in (torch.float16, torch.bfloat16, torch.float32)
             or getattr(ctx, "dtype_B", None) != torch.uint8):
+        return False
+    if torch.cuda.get_device_capability(grad_output.device) < (8, 0):
         return False
     needs = getattr(ctx, "needs_input_grad", ())
     if len(needs) != 5 or not needs[0] or needs[1] or needs[3]:

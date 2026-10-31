@@ -1,5 +1,11 @@
 # Check 4 candidate: real MLP input-gradient GEMM
 
+**Superseded on T4:** both solution runs of `3351e4b` failed; their traceback is
+not yet available. An independent audit found that Triton 3.6.0 lowers ordinary
+`tl.dot` to FMA on SM75. The correction keeps original bitsandbytes backward on
+T4 and limits this GEMM to SM80+. See [SM75_AUDIT.md](SM75_AUDIT.md). The discussion
+below records the original candidate, not evidence of successful T4 training.
+
 ## Measured starting point and target
 
 The team confirmed that commit `6b175fb51c0ee1d272d9b3098d1b3df275bbc270`

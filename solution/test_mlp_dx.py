@@ -193,12 +193,17 @@ def test_mlp_dx_real_nf4_layer_preserves_forward_and_input_gradient(
         actual = layer(x)
     actual.backward(upstream)
 
-    assert calls == [((2, 64, out_features), (out_features, in_features))]
+    uses_custom_gemm = torch.cuda.get_device_capability(x.device) >= (8, 0)
+    expected_calls = [((2, 64, out_features), (out_features, in_features))]
+    # Triton 3.6.0 uses FMA rather than MMA on SM75. On T4 the complete
+    # original bnb backward must run, without even calling our GEMM helper.
+    assert calls == (expected_calls if uses_custom_gemm else [])
     assert actual.dtype == expected.dtype == torch.float32
     assert x.grad.dtype == ref_x.grad.dtype == torch.float32
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
     torch.testing.assert_close(actual.square().mean(), expected.square().mean(), rtol=0, atol=0)
-    torch.testing.assert_close(x.grad, ref_x.grad, rtol=2e-3, atol=2e-3)
+    tolerance = 2e-3 if uses_custom_gemm else 0
+    torch.testing.assert_close(x.grad, ref_x.grad, rtol=tolerance, atol=tolerance)
     torch.testing.assert_close(x, before_x, rtol=0, atol=0)
     torch.testing.assert_close(layer.weight, before_weight, rtol=0, atol=0)
     assert layer.weight.grad is None

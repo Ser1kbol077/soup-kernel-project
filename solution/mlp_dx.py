@@ -72,13 +72,16 @@ def _supported(grad, weight):
         or (torch.is_grad_enabled() and (grad.requires_grad or weight.requires_grad))
     ):
         return False
-    return torch.cuda.get_device_capability(grad.device) >= (7, 5)
+    # Triton 3.6.0 AccelerateMatmul declines MMA below SM80. On T4 this large
+    # tile becomes scalar FMA with spills, rather than a Tensor Core GEMM.
+    # Keep native matmul on those devices instead of selecting that path.
+    return torch.cuda.get_device_capability(grad.device) >= (8, 0)
 
 
 def mlp_input_grad(grad, weight):
     """Compute ``grad @ weight`` without changing first/higher-order autograd.
 
-    The Triton path accepts contiguous CUDA FP16 operands on SM 7.5 or newer,
+    The Triton path accepts contiguous CUDA FP16 operands on SM 8.0 or newer,
     with a two- or three-dimensional gradient and a two-dimensional weight.
     Calls that require an autograd graph, unsupported layouts/devices/dtypes,
     and empty shapes keep native ``torch.matmul`` semantics.
@@ -89,8 +92,8 @@ def mlp_input_grad(grad, weight):
     k, n = weight.shape
     m = grad.numel() // k
     result = torch.empty((*grad.shape[:-1], n), device=grad.device, dtype=grad.dtype)
-    # Two pipeline stages need 24 KiB of operand tiles. This conservative
-    # fixed configuration fits T4 without an autotuning warm-up or workspace.
+    # Fixed configuration without an autotuning warm-up or workspace.
+    # Pre-SM80 devices retain native matmul before reaching this launch.
     block_m, block_n, block_k = 64, 128, 32
     grid = (triton.cdiv(m, block_m) * triton.cdiv(n, block_n),)
     with torch.cuda.device(grad.device):

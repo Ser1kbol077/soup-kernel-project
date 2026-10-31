@@ -1,6 +1,8 @@
 # Submission draft — Soup Kernel Challenge
 
-Status: first implementation; Kaggle T4 correctness and benchmark pending.
+Status: `3351e4b` failed both T4 solution runs. An SM75 dispatch correction is
+pending training validation; see solution/SM75_AUDIT.md. The traceback is still
+needed to establish the original failure's cause.
 
 ## Links
 
@@ -21,7 +23,7 @@ Status: first implementation; Kaggle T4 correctness and benchmark pending.
 | vocab_entropy_finalize_kernel | solution/vocab_ops.py | Categorical entropy | Pending T4 |
 | rmsnorm_row_forward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm forward | Pending T4 |
 | rmsnorm_row_backward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm input gradient | Pending T4 |
-| mlp_input_grad_kernel | solution/mlp_dx.py | Frozen NF4 MLP input-gradient matrix product | Pending T4, target total ≥6% |
+| mlp_input_grad_kernel | solution/mlp_dx.py | Frozen NF4 MLP input-gradient matrix product, SM80+ only | Disabled on T4; native backward |
 
 Written from scratch using standard mathematics. Integration contracts and primary
 source links are in README.md. The shipped example SwiGLU remains enabled and is
@@ -49,5 +51,6 @@ previous 1.084x / 12385 MiB result is not a measurement of this new candidate.
 
 No GPU correctness or performance result is claimed before these runs.
 
-Check-4 follow-up: `6b175fb` measured 2.4% and 9/10 PASS; parent `b7d39a8` and
-the new GEMM candidate are unmeasured. Details: solution/CHECK4.md.
+Check-4 follow-up: `6b175fb` measured 2.4% and 9/10 PASS. `3351e4b` produced no
+successful solution run. The corrected T4 dispatch preserves the other patches;
+its training, quality and original-kernel share require new measurements.
