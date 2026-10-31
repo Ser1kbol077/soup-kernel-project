@@ -4,6 +4,10 @@ Status: `3351e4b` failed both T4 solution runs. An SM75 dispatch correction is
 pending training validation; see solution/SM75_AUDIT.md. The traceback is still
 needed to establish the original failure's cause.
 
+This branch additionally experiments with strided vocabulary argmax to avoid
+the token-accuracy logits clone. It is separate from the in-flight `298a64c`
+measurement. See solution/ACCURACY_CANDIDATE.md; no new T4 result is claimed.
+
 ## Links
 
 - Repository: https://github.com/Ser1kbol077/soup-kernel-project
@@ -24,6 +28,8 @@ needed to establish the original failure's cause.
 | rmsnorm_row_forward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm forward | Pending T4 |
 | rmsnorm_row_backward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm input gradient | Pending T4 |
 | mlp_input_grad_kernel | solution/mlp_dx.py | Frozen NF4 MLP input-gradient matrix product, SM80+ only | Disabled on T4; native backward |
+| vocab_argmax_tile_kernel | solution/argmax_ops.py | Strided per-tile token prediction statistics | Pending T4 |
+| vocab_argmax_finish_kernel | solution/argmax_ops.py | Exact first-index argmax for token accuracy | Pending T4 |
 
 Written from scratch using standard mathematics. Integration contracts and primary
 source links are in README.md. The shipped example SwiGLU remains enabled and is

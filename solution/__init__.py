@@ -14,6 +14,7 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 def apply():
+    from .accuracy_patch import patch_sft_accuracy
     from .causal_loss import patch_qwen2_causal_loss
     from .compact_swiglu import patch_compact_qwen2_mlp
     from .mlp_backward import patch_mlp_input_grad
@@ -27,3 +28,4 @@ def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_compact_qwen2_mlp()
     patch_mlp_input_grad()
+    patch_sft_accuracy()

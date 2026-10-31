@@ -12,6 +12,15 @@ bitsandbytes backward на T4; собственный MLP GEMM допускае�
 Цель ≥6% остаётся неподтверждённой. На `6b175fb` измерено 2.4% и 9/10 PASS.
 История кандидата: [solution/CHECK4.md](solution/CHECK4.md).
 
+**Отдельный эксперимент `codex/t4-strided-accuracy`:** два оригинальных
+Triton-кернела считают argmax непосредственно по сдвинутым logits для token
+accuracy. Это устраняет промежуточную FP32-копию размером до **1184.68 MiB**
+при полном батче. Это размер буфера, не измеренное снижение peak. Проверяемая
+ветка `codex/triton-vocab-t4` сохранена на `298a64c`.
+Исследование, тесты и план следующего запуска:
+[solution/ACCURACY_CANDIDATE.md](solution/ACCURACY_CANDIDATE.md).
+**≤45 секунд, улучшение скорости и доля ≥5% не подтверждены.**
+
 Новая версия добавляет FP32 loss без полной FP32-копии logits, пропуск ignored
 строк в CE, оригинальный fused RMSNorm и lossless FP16-кэш активаций SwiGLU.
 Подробности и расчёт памяти: [solution/OPTIMIZATION_NOTES.md](solution/OPTIMIZATION_NOTES.md).
@@ -50,6 +59,8 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `rmsnorm_row_forward_kernel` | Нормализация и масштабирование frozen FP32 RMSNorm |
 | `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
 | `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для MLP backward только на SM80+; на T4 native |
+| `vocab_argmax_tile_kernel` | Максимум и первый индекс внутри vocabulary-тайла без копии logits |
+| `vocab_argmax_finish_kernel` | Объединение максимумов в точные token predictions для accuracy |
 
 Код написан самостоятельно: [solution/vocab_ops.py](solution/vocab_ops.py).
 FP32-редукции и сдвинутые экспоненты обеспечивают численную устойчивость.
@@ -149,7 +160,7 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 | Проверка/метрика | Текущий результат |
 |---|---|
 | Сверка исходного шаблона | 24/24 blob SHA совпадают |
-| Штатный `source_kernels()` | 7 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
+| Штатный `source_kernels()` | Проверить текущий кандидат; определение кернела не подтверждает его запуск или долю |
 | Python / notebook syntax, `git diff --check` | Успешно; GPU-код не запускался |
 | GPU correctness на T4 | Для `6e6781b` команда сообщила 51 PASS / 2 FAIL; FP16 entropy исправлен, повторная GPU-проверка ожидается |
 | 79 Soup regression tests | Не запускалось: локально нет зависимостей |
