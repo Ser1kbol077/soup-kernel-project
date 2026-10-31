@@ -1,5 +1,10 @@
 # Architecture and rule audit
 
+This records the first-stage audit. The next candidate adds two original RMSNorm
+kernels, direct FP32 loss accumulation from FP16 logits, ignored-row skipping and
+lossless compact activation storage; see [OPTIMIZATION_NOTES.md](OPTIMIZATION_NOTES.md).
+Its additional T4 correctness/performance measurements are still pending.
+
 ## Baseline and execution path
 
 Before implementation, all 24 tracked files at local baseline `05cb258` were

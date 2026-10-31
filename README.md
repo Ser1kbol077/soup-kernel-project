@@ -3,6 +3,14 @@
 Первая версия оптимизации обучения **Qwen2.5-1.5B-Instruct на Kaggle Tesla T4** для
 Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-кернелы.
 
+Новая версия добавляет FP32 loss без полной FP32-копии logits, пропуск ignored
+строк в CE, оригинальный fused RMSNorm и lossless FP16-кэш активаций SwiGLU.
+Подробности и расчёт памяти: [solution/OPTIMIZATION_NOTES.md](solution/OPTIMIZATION_NOTES.md).
+
+По отчёту команды предыдущая версия дала **1.084x** ускорение и **12385 MiB**
+вместо **14345 MiB**, eval loss 2.04965 против 2.04967. Это результаты предыдущего
+запуска; прирост новой версии и все 10 правил требуют повторного измерения.
+
 **Статус: подготовлено к тестированию на T4. Корректность на GPU, ускорение, снижение
 памяти и прохождение всех правил пока НЕ подтверждены.** Локально: Windows,
 Python 3.14, RTX 3050 4 ГБ, без PyTorch/Triton/pytest.
@@ -29,6 +37,8 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `vocab_ce_finalize_kernel` | Объединение частичных сумм и token CE |
 | `vocab_ce_backward_kernel` | Пересчёт softmax и градиент `(p - one_hot) * grad_loss` |
 | `vocab_entropy_finalize_kernel` | Энтропия через partition function и первый момент |
+| `rmsnorm_row_forward_kernel` | Нормализация и масштабирование frozen FP32 RMSNorm |
+| `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
 
 Код написан самостоятельно: [solution/vocab_ops.py](solution/vocab_ops.py).
 FP32-редукции и сдвинутые экспоненты обеспечивают численную устойчивость.
@@ -46,12 +56,20 @@ Entropy и rewind также обходятся без промежуточны�
 - `soup_cli.trainer.rewind_hf.row_losses`: прежнее выравнивание `t -> t+1`,
   строки и token counts; пустая supervised-строка даёт loss 0 и count 0.
 
-Hooks ограничены CUDA FP32 logits нужного словаря. Остальные случаи используют
+Metrics hooks ограничены CUDA FP32 logits нужного словаря. Остальные случаи используют
 оригинальные функции. FP32 в реальном main CE обеспечивает исходный
 `ForCausalLMLoss`, в возвращаемых logits для метрик — штатный Accelerate wrapper.
 Повторный `apply()` безопасен.
 
-Штатный SwiGLU оставлен включённым; добавлена только защита от повторного patch.
+Новый instance loss hook Qwen2 принимает исходные FP16 logits и накапливает CE
+в FP32 внутри Triton, сохраняя FP16 gradient. Он заменяет `CE(logits.float())`
+без отдельной плотной FP32-копии для loss; forward/backward сравниваются с
+исходным Transformers. Полные logits, FP32 metrics и token counting сохраняются.
+
+Штатный SwiGLU оставлен включённым. Для proven FP16-origin выходов frozen NF4
+gate/up проекций backward-кэш хранится в FP16 без потери значений; forward и
+градиенты остаются FP32. При полном батче объём кэша расчётно уменьшается на
+1.914 GiB; это не измеренное изменение peak памяти.
 **Его кернелы не считаются нашими**, включая долю 5%.
 Модель, данные, batch order/size, LoRA/dropout, optimizer, scheduler и настройки
 обучения не менялись. `harness/`, `tests/`, `task/` не изменены.
@@ -120,11 +138,12 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 | Проверка/метрика | Текущий результат |
 |---|---|
 | Сверка исходного шаблона | 24/24 blob SHA совпадают |
-| Штатный `source_kernels()` | 4 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
+| Штатный `source_kernels()` | 6 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
 | Python / notebook syntax, `git diff --check` | Успешно; GPU-код не запускался |
 | GPU correctness на T4 | Для `6e6781b` команда сообщила 51 PASS / 2 FAIL; FP16 entropy исправлен, повторная GPU-проверка ожидается |
 | 79 Soup regression tests | Не запускалось: локально нет зависимостей |
-| Время / peak MiB / eval loss / доля кернелов | Нет измерений на T4 |
+| Предыдущая версия, по отчёту команды | 1.084x; 12385 vs 14345 MiB; eval 2.04965 vs 2.04967 |
+| Новая версия: время / peak MiB / eval / доля | Требуется повторный T4 benchmark |
 | Все 10 правил | Не подтверждено |
 
 Это первая реализация без T4 autotuning, с фиксированным tile 4096. Холодная

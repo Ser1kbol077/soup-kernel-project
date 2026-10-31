@@ -14,8 +14,14 @@ The rules in short (the README and the task statement have the full ones):
 """
 
 def apply():
+    from .causal_loss import patch_qwen2_causal_loss
+    from .compact_swiglu import patch_compact_qwen2_mlp
     from .patches import patch_vocab_operations
+    from .rmsnorm import patch_qwen2_rmsnorm
     from .swiglu import patch_qwen2_mlp
 
     patch_vocab_operations()
+    patch_qwen2_causal_loss()
+    patch_qwen2_rmsnorm()
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
+    patch_compact_qwen2_mlp()

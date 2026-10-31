@@ -16,24 +16,34 @@ VOCAB_TILE = 4096
 
 
 @triton.jit
-def vocab_partition_kernel(X, Max, Sum, Moment, V: tl.constexpr,
+def vocab_partition_kernel(X, Target, Max, Sum, Moment, V: tl.constexpr,
                            ROW_STRIDE: tl.constexpr, PARTS: tl.constexpr,
-                           ENTROPY: tl.constexpr, BLOCK: tl.constexpr):
+                           ENTROPY: tl.constexpr, MASK_TARGET: tl.constexpr,
+                           IGNORE: tl.constexpr, BLOCK: tl.constexpr):
     row = tl.program_id(0)
     part = tl.program_id(1)
     col = part * BLOCK + tl.arange(0, BLOCK)
-    value = tl.load(X + row * ROW_STRIDE + col, col < V, other=-float("inf")).to(tl.float32)
-    maximum = tl.max(value, 0)
-    shifted = value - maximum
-    probability = tl.exp(shifted)
     index = row * PARTS + part
-    tl.store(Max + index, maximum)
-    tl.store(Sum + index, tl.sum(probability, 0))
-    if ENTROPY:
-        # Avoid 0 * -inf in the masked tail. Shift before the moment reduction
-        # to retain precision when every logit has a large common offset.
-        moment = probability * tl.where(col < V, shifted, 0.0)
-        tl.store(Moment + index, tl.sum(moment, 0))
+    active = True
+    if MASK_TARGET:
+        active = tl.load(Target + row) != IGNORE
+    if active:
+        value = tl.load(X + row * ROW_STRIDE + col, col < V, other=-float("inf")).to(tl.float32)
+        maximum = tl.max(value, 0)
+        shifted = value - maximum
+        probability = tl.exp(shifted)
+        tl.store(Max + index, maximum)
+        tl.store(Sum + index, tl.sum(probability, 0))
+        if ENTROPY:
+            # Avoid 0 * -inf in the masked tail. Shift before the moment reduction
+            # to retain precision when every logit has a large common offset.
+            moment = probability * tl.where(col < V, shifted, 0.0)
+            tl.store(Moment + index, tl.sum(moment, 0))
+    else:
+        # Prompt/padding labels have zero CE and zero gradient. Do not read or
+        # exponentiate their entire vocabulary, which dominates memory traffic.
+        tl.store(Max + index, 0.0)
+        tl.store(Sum + index, 1.0)
 
 
 @triton.jit
@@ -42,17 +52,22 @@ def vocab_ce_finalize_kernel(X, Target, Max, Sum, RowMax, LogSum, Loss,
                              PARTS: tl.constexpr, IGNORE: tl.constexpr,
                              BLOCK: tl.constexpr):
     row = tl.program_id(0)
-    part = tl.arange(0, BLOCK)
-    maxima = tl.load(Max + row * PARTS + part, part < PARTS, other=-float("inf"))
-    sums = tl.load(Sum + row * PARTS + part, part < PARTS, other=0.0)
-    maximum = tl.max(maxima, 0)
-    log_sum = tl.log(tl.sum(sums * tl.exp(maxima - maximum), 0))
     label = tl.load(Target + row)
-    valid = (label != IGNORE) & (label >= 0) & (label < V)
-    selected = tl.load(X + row * ROW_STRIDE + label, valid, other=0.0).to(tl.float32)
-    tl.store(RowMax + row, maximum)
-    tl.store(LogSum + row, log_sum)
-    tl.store(Loss + row, tl.where(valid, (maximum - selected) + log_sum, 0.0))
+    if label != IGNORE:
+        part = tl.arange(0, BLOCK)
+        maxima = tl.load(Max + row * PARTS + part, part < PARTS, other=-float("inf"))
+        sums = tl.load(Sum + row * PARTS + part, part < PARTS, other=0.0)
+        maximum = tl.max(maxima, 0)
+        log_sum = tl.log(tl.sum(sums * tl.exp(maxima - maximum), 0))
+        valid = (label >= 0) & (label < V)
+        selected = tl.load(X + row * ROW_STRIDE + label, valid, other=0.0).to(tl.float32)
+        tl.store(RowMax + row, maximum)
+        tl.store(LogSum + row, log_sum)
+        tl.store(Loss + row, tl.where(valid, (maximum - selected) + log_sum, 0.0))
+    else:
+        tl.store(RowMax + row, 0.0)
+        tl.store(LogSum + row, 0.0)
+        tl.store(Loss + row, 0.0)
 
 
 @triton.jit
@@ -62,14 +77,17 @@ def vocab_ce_backward_kernel(X, Target, RowMax, LogSum, GradLoss, GradX,
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     label = tl.load(Target + row)
-    maximum = tl.load(RowMax + row)
-    log_sum = tl.load(LogSum + row)
-    value = tl.load(X + row * ROW_STRIDE + col, col < V, other=-float("inf")).to(tl.float32)
-    grad = tl.load(GradLoss + row).to(tl.float32)
-    probability = tl.exp((value - maximum) - log_sum)
-    # where, rather than multiplication by zero: all-ignored mean loss has
-    # NaN upstream scaling, while PyTorch still returns exactly zero grad.
-    result = tl.where(label != IGNORE, (probability - (col == label).to(tl.float32)) * grad, 0.0)
+    if label != IGNORE:
+        maximum = tl.load(RowMax + row)
+        log_sum = tl.load(LogSum + row)
+        value = tl.load(X + row * ROW_STRIDE + col, col < V, other=-float("inf")).to(tl.float32)
+        grad = tl.load(GradLoss + row).to(tl.float32)
+        probability = tl.exp((value - maximum) - log_sum)
+        result = (probability - (col == label).to(tl.float32)) * grad
+    else:
+        # In particular, never multiply by a NaN upstream grad from an
+        # all-ignored mean: PyTorch returns exactly zero input gradients.
+        result = tl.full((BLOCK,), 0.0, tl.float32)
     tl.store(GradX + row * V + col, result, col < V)
 
 
@@ -89,21 +107,24 @@ def vocab_entropy_finalize_kernel(Max, Sum, Moment, Out,
     tl.store(Out + row, tl.log(partition) - moment / partition)
 
 
-def _supported(logits):
+def _supported(logits, allow_half=False):
     return (logits.is_cuda and logits.ndim == 2 and logits.size(0) > 0
             and logits.size(1) > 0 and logits.stride(1) == 1
-            and logits.dtype == torch.float32)
+            and (logits.dtype == torch.float32
+                 or (allow_half and logits.dtype == torch.float16)))
 
 
-def _partition(logits, entropy=False):
+def _partition(logits, entropy=False, targets=None, ignore_index=-100):
     rows, vocab = logits.shape
     parts = triton.cdiv(vocab, VOCAB_TILE)
     maxima = torch.empty((rows, parts), device=logits.device, dtype=torch.float32)
     sums = torch.empty_like(maxima)
     moments = torch.empty_like(maxima) if entropy else sums
     vocab_partition_kernel[(rows, parts)](
-        logits, maxima, sums, moments, vocab, logits.stride(0), parts,
-        entropy, VOCAB_TILE, num_warps=4, enable_fp_fusion=False,
+        logits, targets if targets is not None else logits,
+        maxima, sums, moments, vocab, logits.stride(0), parts,
+        entropy, targets is not None, ignore_index, VOCAB_TILE,
+        num_warps=4, enable_fp_fusion=False,
     )
     return maxima, sums, moments
 
@@ -117,10 +138,12 @@ class _TokenCrossEntropy(torch.autograd.Function):
                              | ((targets >= 0) & (targets < logits.size(1)))).all(),
                             "cross_entropy target out of bounds")
         rows, vocab = logits.shape
-        maxima, sums, _ = _partition(logits)
+        maxima, sums, _ = _partition(logits, targets=targets, ignore_index=ignore_index)
         row_max = torch.empty(rows, device=logits.device, dtype=torch.float32)
         log_sum = torch.empty_like(row_max)
-        loss = torch.empty(rows, device=logits.device, dtype=logits.dtype)
+        # Half inputs are promoted inside each tile, avoiding a dense FP32
+        # cast while retaining the original Transformers FP32 loss semantics.
+        loss = torch.empty(rows, device=logits.device, dtype=torch.float32)
         parts = maxima.size(1)
         vocab_ce_finalize_kernel[(rows,)](
             logits, targets, maxima, sums, row_max, log_sum, loss,
@@ -152,11 +175,27 @@ def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
     The hook supplies fp32 logits just as Transformers does. Keeping reductions
     in PyTorch also preserves its mean-of-zero-valid-tokens NaN semantics.
     """
-    if (not _supported(logits) or targets.ndim != 1
+    return _cross_entropy(logits, targets, reduction, ignore_index, fp32_output=False)
+
+
+def cross_entropy_fp32(logits, targets, reduction="mean", ignore_index=-100):
+    """Equivalent to CE on ``logits.float()``, without a dense FP32 copy.
+
+    CUDA FP16/FP32 logits use FP32 tile reductions and FP32 loss output.
+    Backward stores each input gradient in the original input dtype, just as
+    autograd through the native FP32 cast does. Unsupported cases keep that
+    native cast and cross-entropy behavior.
+    """
+    return _cross_entropy(logits, targets, reduction, ignore_index, fp32_output=True)
+
+
+def _cross_entropy(logits, targets, reduction, ignore_index, fp32_output):
+    if (not _supported(logits, allow_half=fp32_output) or targets.ndim != 1
             or targets.shape[0] != logits.shape[0] or targets.dtype != torch.long
             or targets.device != logits.device or not targets.is_contiguous()
             or reduction not in ("none", "sum", "mean")):
-        return F.cross_entropy(logits, targets, reduction=reduction, ignore_index=ignore_index)
+        source = logits.float() if fp32_output else logits
+        return F.cross_entropy(source, targets, reduction=reduction, ignore_index=ignore_index)
     with torch.cuda.device(logits.device):
         losses = _TokenCrossEntropy.apply(logits, targets, ignore_index)
     if reduction == "none":
