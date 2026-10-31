@@ -18,6 +18,7 @@ def apply():
     from .causal_loss import patch_qwen2_causal_loss
     from .compact_swiglu import patch_compact_qwen2_mlp
     from .mlp_backward import patch_mlp_input_grad
+    from .mlp_casts import patch_cast_elided_qwen2_mlp
     from .patches import patch_vocab_operations
     from .rmsnorm import patch_qwen2_rmsnorm
     from .swiglu import patch_qwen2_mlp
@@ -28,4 +29,5 @@ def apply():
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_compact_qwen2_mlp()
     patch_mlp_input_grad()
+    patch_cast_elided_qwen2_mlp()
     patch_sft_accuracy()
