@@ -17,13 +17,15 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def mlp_input_grad_kernel(Grad, Weight, Result,
-                          M: tl.constexpr, N: tl.constexpr, K: tl.constexpr,
+                          M, N: tl.constexpr, K: tl.constexpr,
                           BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
                           BLOCK_K: tl.constexpr, GROUP_M: tl.constexpr):
     # Traverse several row tiles for each column tile before advancing the
     # columns. Neighboring programs can reuse the same weight tile in L2.
+    # M is a runtime scalar: varying padded sequence lengths reuse a compiled
+    # kernel instead of adding compilation work to later training steps.
     row_tiles = tl.cdiv(M, BLOCK_M)
     column_tiles = tl.cdiv(N, BLOCK_N)
     tile = tl.program_id(0)

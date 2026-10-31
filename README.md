@@ -3,6 +3,12 @@
 Первая версия оптимизации обучения **Qwen2.5-1.5B-Instruct на Kaggle Tesla T4** для
 Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-кернелы.
 
+Текущий кандидат для **check 4** заменяет реальный input-gradient GEMM трёх
+замороженных NF4 MLP-проекций собственным `mlp_input_grad_kernel`. Цель — ≥6%
+суммарного времени собственных кернелов. На `6b175fb` измерено 2.4% и 9/10 PASS;
+`b7d39a8` и этот новый кандидат ещё не проверены на T4.
+Выбор операции, guards и план проверки: [solution/CHECK4.md](solution/CHECK4.md).
+
 Новая версия добавляет FP32 loss без полной FP32-копии logits, пропуск ignored
 строк в CE, оригинальный fused RMSNorm и lossless FP16-кэш активаций SwiGLU.
 Подробности и расчёт памяти: [solution/OPTIMIZATION_NOTES.md](solution/OPTIMIZATION_NOTES.md).
@@ -39,6 +45,7 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `vocab_entropy_finalize_kernel` | Энтропия через partition function и первый момент |
 | `rmsnorm_row_forward_kernel` | Нормализация и масштабирование frozen FP32 RMSNorm |
 | `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
+| `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для настоящего MLP backward |
 
 Код написан самостоятельно: [solution/vocab_ops.py](solution/vocab_ops.py).
 FP32-редукции и сдвинутые экспоненты обеспечивают численную устойчивость.
@@ -138,12 +145,13 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 | Проверка/метрика | Текущий результат |
 |---|---|
 | Сверка исходного шаблона | 24/24 blob SHA совпадают |
-| Штатный `source_kernels()` | 6 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
+| Штатный `source_kernels()` | 7 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
 | Python / notebook syntax, `git diff --check` | Успешно; GPU-код не запускался |
 | GPU correctness на T4 | Для `6e6781b` команда сообщила 51 PASS / 2 FAIL; FP16 entropy исправлен, повторная GPU-проверка ожидается |
 | 79 Soup regression tests | Не запускалось: локально нет зависимостей |
 | Предыдущая версия, по отчёту команды | 1.084x; 12385 vs 14345 MiB; eval 2.04965 vs 2.04967 |
 | Новая версия: время / peak MiB / eval / доля | Требуется повторный T4 benchmark |
+| `6b175fb`: правила, по отчёту команды | 9/10 PASS; check 4 FAIL при 2.4%; 79 Soup tests PASS |
 | Все 10 правил | Не подтверждено |
 
 Это первая реализация без T4 autotuning, с фиксированным tile 4096. Холодная
