@@ -19,10 +19,17 @@ Status: first implementation; Kaggle T4 correctness and benchmark pending.
 | vocab_ce_finalize_kernel | solution/vocab_ops.py | Token CE | Pending T4 |
 | vocab_ce_backward_kernel | solution/vocab_ops.py | CE backward | Pending T4 |
 | vocab_entropy_finalize_kernel | solution/vocab_ops.py | Categorical entropy | Pending T4 |
+| rmsnorm_row_forward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm forward | Pending T4 |
+| rmsnorm_row_backward_kernel | solution/rmsnorm.py | Frozen FP32 RMSNorm input gradient | Pending T4 |
 
 Written from scratch using standard mathematics. Integration contracts and primary
 source links are in README.md. The shipped example SwiGLU remains enabled and is
 excluded from our share.
+
+The next candidate also uses FP32 CE accumulation directly from half logits,
+skips ignored-row vocabulary work and stores proven half-origin MLP caches
+losslessly in FP16. See solution/OPTIMIZATION_NOTES.md. The team's reported
+previous 1.084x / 12385 MiB result is not a measurement of this new candidate.
 
 ## Results on Kaggle T4
 
