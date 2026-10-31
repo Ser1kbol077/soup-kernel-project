@@ -122,7 +122,7 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 | Сверка исходного шаблона | 24/24 blob SHA совпадают |
 | Штатный `source_kernels()` | 4 оригинальных, 2 исключённых example; без banned imports/AST errors/lookalikes |
 | Python / notebook syntax, `git diff --check` | Успешно; GPU-код не запускался |
-| GPU correctness на T4 | Не запускалось |
+| GPU correctness на T4 | Для `6e6781b` команда сообщила 51 PASS / 2 FAIL; FP16 entropy исправлен, повторная GPU-проверка ожидается |
 | 79 Soup regression tests | Не запускалось: локально нет зависимостей |
 | Время / peak MiB / eval loss / доля кернелов | Нет измерений на T4 |
 | Все 10 правил | Не подтверждено |
@@ -131,6 +131,9 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 компиляция учитывается в benchmark. Custom CE поддерживает first-order backward;
 double backward не реализован. FP16/BF16 и неподходящие layouts идут через native
 fallback. Изменение пика памяти и скорости не гарантируется до измерения.
+
+Разбор FP16 entropy, сравнение actual/reference на CPU и границы проверки
+исправления: [solution/ENTROPY_FIX.md](solution/ENTROPY_FIX.md).
 
 ## Источники и лицензии
 

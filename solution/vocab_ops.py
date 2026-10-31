@@ -166,6 +166,15 @@ def cross_entropy(logits, targets, reduction="mean", ignore_index=-100):
 
 
 def _native_entropy(logits):
+    # Metrics must not round every intermediate to FP16. In particular, many
+    # equal/quantized logits can make log_softmax rounding errors coherent
+    # across thousands of classes. Cast only the reduced result back to FP16.
+    # Keep the native differentiable path exactly as before (including dtype).
+    if (logits.dtype == torch.float16
+            and not (torch.is_grad_enabled() and logits.requires_grad)):
+        log_probs = logits.log_softmax(dim=-1, dtype=torch.float32)
+        entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+        return entropy.to(logits.dtype)
     log_probs = logits.log_softmax(dim=-1)
     return -(log_probs.exp() * log_probs).sum(dim=-1)
 
@@ -174,7 +183,8 @@ def entropy_from_logits(logits, chunk_size=128):
     """Exact categorical entropy, fused only for the no-grad metrics path.
 
     chunk_size is accepted for TRL API compatibility; tiling is by vocabulary.
-    Autograd callers keep a native differentiable path.
+    Autograd callers keep a native differentiable path. The FP16 metrics
+    fallback computes intermediates in FP32 and returns the input dtype.
     """
     if (logits.ndim < 2 or not logits.is_contiguous()
             or (torch.is_grad_enabled() and logits.requires_grad)):
