@@ -99,8 +99,10 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
                            rmsnorm_row_backward_kernel=kernel("norm_bwd"))
     rotary = SimpleNamespace(BLOCK=256, rotary_forward_kernel=kernel("rotary_fwd"),
                              rotary_backward_kernel=kernel("rotary_bwd"))
+    branches = SimpleNamespace(BLOCK=256, mlp_branch_sum_kernel=kernel("branch_sum"))
     vocab = SimpleNamespace(VOCAB_TILE=4096, vocab_ce_backward_kernel=kernel("gradient"))
-    for name, module in (("nf4_decode", nf4), ("rmsnorm", norm), ("rotary", rotary),
+    for name, module in (("mlp_branch_sum", branches), ("nf4_decode", nf4),
+                         ("rmsnorm", norm), ("rotary", rotary),
                          ("streamed_head", head), ("vocab_ops", vocab)):
         monkeypatch.setattr(solution, name, module, raising=False)
     dtypes = SimpleNamespace(float16="half", float32="float", int32="int", int64="long", uint8="byte")
@@ -110,7 +112,7 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
             self.dtype = dtype
 
     specs = list(overlap._compile_specs(dtypes, Mock))
-    assert len(specs) == 17
+    assert len(specs) == 18
     tile_specs = [spec for spec in specs if spec[1].name == "tile"]
     merge_specs = [spec for spec in specs if spec[1].name == "merge"]
     assert [spec[0] for spec in tile_specs] == ["head_tile_tail0", "head_tile_tail1",
@@ -127,6 +129,10 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
     assert all(spec[2][4:] == (98304, 128, 12, 196608, 128, 1536,
                              196608, 128, 1536, 0, 0, 256) for spec in rotation)
     assert all(spec[3] == (384,) for spec in rotation)
+    branch = next(spec for spec in specs if spec[0] == "mlp_branch_sum")
+    assert branch[1].name == "branch_sum"
+    assert tuple(arg.dtype for arg in branch[2][:3]) == ("half", "half", "float")
+    assert branch[2][3:] == (1536, 256) and branch[3] == (6,)
 
 
 def test_cpu_setup_does_not_install_or_start_worker(isolated_state):

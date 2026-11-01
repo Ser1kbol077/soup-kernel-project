@@ -11,8 +11,11 @@ Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-ке
 SHA, полный `result.json` и GPU-профиль пока не переданы. Этот запуск ещё
 не допущен к соревнованию; его цифры не относятся к новому кандидату.
 
-**Текущий кандидат на ветке `codex/t4-mlp-cast-elision`: собственные FP32 RoPE
-forward/backward с устранением промежуточных вращений и произведений.**
+**Новый шаг на ветке `codex/t4-mlp-cast-elision`: собственное FP32-накопление
+двух FP16 входных градиентов MLP без отдельной материализации gate в FP32.**
+Это единственная новая оптимизация в текущем шаге; ранее добавленный FP32 RoPE
+также требует полного T4-прогона. Сравнение архитектур, источники идей,
+расчёт памяти и приоритеты: [solution/ARCHITECTURE_COMPARISON.md](solution/ARCHITECTURE_COMPARISON.md).
 Сначала нужны **10/10 PASS**, затем совместная оптимизация к **≤40 с полного
 времени**, **≤3671 MiB** и **≥6% полезных собственных кернелов**.
 Разбор и план замера: [solution/ROTARY_CANDIDATE.md](solution/ROTARY_CANDIDATE.md).
@@ -104,6 +107,7 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
 | `rotary_forward_kernel` | FP32 RoPE query/key без промежуточных rotate/multiply тензоров |
 | `rotary_backward_kernel` | Входной градиент RoPE с исходным layout и отдельными FP32 округлениями |
+| `mlp_branch_sum_kernel` | Отдельное преобразование двух FP16 branch gradients и их сложение в FP32 за один launch |
 | `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для MLP backward только на SM80+; на T4 native |
 | `vocab_argmax_tile_kernel` | Максимум и первый индекс внутри vocabulary-тайла без копии logits |
 | `vocab_argmax_finish_kernel` | Объединение максимумов в точные token predictions для accuracy |

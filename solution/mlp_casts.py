@@ -13,6 +13,7 @@ import triton
 from torch.autograd.function import once_differentiable
 from torch.nn.modules import module as module_hooks
 
+from .mlp_branch_sum import sum_input_branches
 from .swiglu import BLOCK, example_swiglu_bwd_kernel, example_swiglu_fwd_kernel
 
 HIDDEN = 1536
@@ -107,10 +108,11 @@ class _CastElidedMLP(torch.autograd.Function):
         # Do not add these branches in FP16. In the native graph their separate
         # input-cast backward nodes convert each rounded GEMM result to FP32
         # before the autograd engine accumulates into the original FP32 x.
-        dx = _input_grad(dgate, gate_weight, gate_state, ctx.dequantize).float()
+        gate_dx = _input_grad(dgate, gate_weight, gate_state, ctx.dequantize)
         del dgate
-        dx_up = _input_grad(dup, up_weight, up_state, ctx.dequantize)
-        dx.add_(dx_up)  # FP32 accumulation; TensorIterator promotes the FP16 operand.
+        up_dx = _input_grad(dup, up_weight, up_state, ctx.dequantize)
+        del dup
+        dx = sum_input_branches(gate_dx, up_dx)
         return dx, None, None
 
 

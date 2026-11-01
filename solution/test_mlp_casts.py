@@ -186,6 +186,18 @@ def test_mlp_cast_backward_adds_independently_rounded_branches_in_fp32(monkeypat
     up_dx = torch.tensor([[1., -1., -1.]], dtype=torch.float16)
     remaining = [torch.zeros_like(gate), gate_dx, up_dx]
     monkeypatch.setattr(mlp_casts, "_input_grad", lambda *args: remaining.pop(0))
+    calls = []
+    native_sum = mlp_casts.sum_input_branches
+
+    def watched_sum(first, second):
+        # Both native GEMM results must reach the fused operation unchanged;
+        # the gate branch must not be separately materialized as FP32 first.
+        assert first is gate_dx and second is up_dx
+        assert first.dtype == second.dtype == torch.float16
+        calls.append((first, second))
+        return native_sum(first, second)
+
+    monkeypatch.setattr(mlp_casts, "sum_input_branches", watched_sum)
 
     class PointwiseStub:
         def __getitem__(self, grid):
@@ -203,7 +215,7 @@ def test_mlp_cast_backward_adds_independently_rounded_branches_in_fp32(monkeypat
     incorrectly_rounded = (gate_dx + up_dx).float()
     assert expected[0, 0].item() == 2049
     assert incorrectly_rounded[0, 0].item() == 2048
-    assert actual.dtype == torch.float32 and not remaining
+    assert actual.dtype == torch.float32 and not remaining and len(calls) == 1
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
 
 

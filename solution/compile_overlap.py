@@ -27,7 +27,7 @@ def _compile_specs(torch, mock_type):
     modulo four change pointer alignment, so compile those useful variants too.
     The mock pointer addresses are only specialization metadata; none is read.
     """
-    from . import nf4_decode, rmsnorm, rotary, streamed_head, vocab_ops
+    from . import mlp_branch_sum, nf4_decode, rmsnorm, rotary, streamed_head, vocab_ops
 
     class Pointer(mock_type):
         def __init__(self, dtype, byte_offset=0):
@@ -73,6 +73,9 @@ def _compile_specs(torch, mock_type):
     rotary_grid = ((128 * 12 * 64 + rotary.BLOCK - 1) // rotary.BLOCK,)
     yield ("rotary_forward", rotary.rotary_forward_kernel, rotary_args, rotary_grid, options)
     yield ("rotary_backward", rotary.rotary_backward_kernel, rotary_args, rotary_grid, options)
+    yield ("mlp_branch_sum", mlp_branch_sum.mlp_branch_sum_kernel,
+           (ptr(f16), ptr(f16), ptr(f32), 1536, mlp_branch_sum.BLOCK),
+           ((1536 + mlp_branch_sum.BLOCK - 1) // mlp_branch_sum.BLOCK,), options)
 
 
 def _build_kernels():
