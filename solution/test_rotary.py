@@ -238,7 +238,11 @@ def test_t4_guard_rejects_changed_attention_contract(t4_metadata_guard, case):
         elif case == "other_axis":
             axis = 2
         elif case == "different_device":
-            sin = torch.empty((2, 5, 128), device="cuda:1")
+            assert supported(q, k, cos, sin, axis)
+            # A CPU FakeTensor exercises the device mismatch without requiring
+            # a second visible CUDA device or initializing an invalid ordinal.
+            sin = torch.empty((2, 5, 128), device="cpu")
+            assert q.device.type == "cuda" and sin.device.type == "cpu"
         assert not supported(q, k, cos, sin, axis)
 
 
