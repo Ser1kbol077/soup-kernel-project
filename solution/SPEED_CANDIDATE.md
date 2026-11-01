@@ -1,5 +1,11 @@
 # Speed candidate: resident decoder and earlier cold compilation
 
+**Historical experiment (`274f3cb`), not the selected production policy.**
+After clarification that memory must also improve below 3671MiB, decoder
+offload was restored. The current next step is
+[fused RoPE](ROTARY_CANDIDATE.md). No T4 result exists for this resident variant.
+The discussion below records its original rationale, not a confirmed gain.
+
 The target is **at most 40 seconds for the complete measured training command**,
 while satisfying all ten unmodified challenge checks. The latest user-supplied
 T4 summary is baseline 86.6s / 14345MiB / eval 2.04963 versus solution

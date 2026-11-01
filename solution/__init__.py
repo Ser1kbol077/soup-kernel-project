@@ -25,6 +25,7 @@ def apply():
     from .nf4_decode import patch_nf4_decode
     from .patches import patch_vocab_operations
     from .rmsnorm import patch_qwen2_rmsnorm
+    from .rotary import patch_qwen2_rotary
     from .swiglu import patch_qwen2_mlp
     from .streamed_head_patch import patch_streamed_head
 
@@ -33,6 +34,7 @@ def apply():
     patch_vocab_operations()
     patch_qwen2_causal_loss()
     patch_qwen2_rmsnorm()
+    patch_qwen2_rotary()
     patch_qwen2_mlp()  # the example: works out of the box, does not count as your own kernel
     patch_compact_qwen2_mlp()
     patch_mlp_input_grad()

@@ -215,54 +215,6 @@ def test_request_context_is_restored_after_model_error(monkeypatch):
         patch._REQUEST.reset(token)
 
 
-@pytest.mark.parametrize("shape,checkpointing,resident", [
-    ((1, 1), False, True), ((4, 512), False, True),
-    ((5, 512), False, False), ((4, 513), False, False),
-    ((4, 512), True, False),
-])
-def test_resident_decoder_policy_is_bounded_to_supported_task_shape(shape, checkpointing, resident):
-    model = _Causal()
-    model.model.gradient_checkpointing = checkpointing
-    labels = torch.empty(shape, dtype=torch.long)
-    assert patch._resident_decoder_call(model, labels) is resident
-
-
-@pytest.mark.parametrize("decoder_error", [False, True])
-def test_residency_is_scoped_to_accepted_decoder_and_restored_after_errors(monkeypatch, decoder_error):
-    from solution import activation_offload as offload
-
-    model, batch, seen = _Causal(), _batch(), []
-    original_decoder = _Decoder.forward
-
-    def watched_decoder(self, **kwargs):
-        seen.append("decoder")
-        assert offload._RESIDENT_ACTIVATIONS.get()
-        if decoder_error:
-            raise RuntimeError("decoder failure")
-        return original_decoder(self, **kwargs)
-
-    def watched_head(*args, **kwargs):
-        seen.append("head")
-        assert not offload._RESIDENT_ACTIVATIONS.get()
-        return _dense_head(*args, **kwargs)
-
-    monkeypatch.setattr(_Decoder, "forward", watched_decoder)
-    monkeypatch.setattr(patch, "_eligible_forward", lambda *args: True)
-    forward = patch._make_forward(_Causal.forward, watched_head, SimpleNamespace)
-    token = patch._REQUEST.set(patch._Request(model))
-    try:
-        if decoder_error:
-            with pytest.raises(RuntimeError, match="decoder failure"):
-                forward(model, **batch)
-            assert seen == ["decoder"]
-        else:
-            assert forward(model, **batch).loss.requires_grad
-            assert seen == ["decoder", "head"]
-        assert not offload._RESIDENT_ACTIVATIONS.get()
-    finally:
-        patch._REQUEST.reset(token)
-
-
 def test_cpu_and_generation_forward_do_not_request_streamed_loss():
     model = _Causal()
 

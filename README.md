@@ -5,19 +5,22 @@ Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-ке
 
 Последний переданный командой отчёт Kaggle T4:
 **86.6 → 83.1 с**, **14345 → 3671 MiB**, eval loss **2.04963 → 2.04965**.
-Это ускорение **1.042×** и снижение пика памяти на **74.4%**. SHA, полный
-`result.json` и результаты всех правил этого запуска пока не переданы;
-эти цифры не относятся к новому варианту ниже.
+Это ускорение **1.042×** и снижение пика памяти на **74.4%**. По уточнению
+команды, **9/10 PASS**: check 4 не пройден при **4.7%** собственных кернелов.
+Все **79 Soup regression tests PASS** по тому же отчёту.
+SHA, полный `result.json` и GPU-профиль пока не переданы. Этот запуск ещё
+не допущен к соревнованию; его цифры не относятся к новому кандидату.
 
-**Текущий кандидат на ветке `codex/t4-mlp-cast-elision`: сохранение decoder
-активаций на GPU вместо PCIe-копий и более ранняя холодная компиляция.**
-Цель — **≤40 с полного времени** при выполнении всех 10 правил. Решение и
-план замера: [solution/SPEED_CANDIDATE.md](solution/SPEED_CANDIDATE.md).
+**Текущий кандидат на ветке `codex/t4-mlp-cast-elision`: собственные FP32 RoPE
+forward/backward с устранением промежуточных вращений и произведений.**
+Сначала нужны **10/10 PASS**, затем совместная оптимизация к **≤40 с полного
+времени**, **≤3671 MiB** и **≥6% полезных собственных кернелов**.
+Разбор и план замера: [solution/ROTARY_CANDIDATE.md](solution/ROTARY_CANDIDATE.md).
 Head считает скрытый градиент при первом проходе и сохраняет его в FP32:
 повторного head GEMM в backward больше нет. Блок увеличен с 64 до 256 токенов.
-В принятом streamed-head вызове batch ≤4, sequence ≤512 decoder activations
-остаются на GPU; для более крупных и неподдерживаемых вызовов сохранён
-асинхронный offload. Арифметика и формы GEMM прежние. Данные, batch size/order, LoRA,
+Экономный асинхронный offload снова включён в production. Эксперимент
+с resident decoder сохранён в commit `274f3cb`; он не измерен и может повысить
+пик памяти, поэтому не выбран для совместной цели. Формы GEMM прежние. Данные, batch size/order, LoRA,
 optimizer и настройки Soup прежние. Изменение порядка FP16-округлений head
 требует повторной проверки loss/градиентов и качества на T4.
 
@@ -32,8 +35,8 @@ SwiGLU-кернелы по-прежнему не засчитываются ка
 ([SM75-аудит](solution/SM75_AUDIT.md)). Остальные оптимизации описаны в
 [solution/OPTIMIZATION_NOTES.md](solution/OPTIMIZATION_NOTES.md).
 
-**Цель ≤40 секунд, память, GPU-корректность нового пути
-и доля ≥5% пока не подтверждены.** Локально выполняются CPU-проверки и offline
+**Цель ≤40 секунд, память ≤3671 MiB, GPU-корректность нового пути
+и доля ≥6% пока не подтверждены.** Локально выполняются CPU-проверки и offline
 SM75-компиляция; они не заменяют обучение и тесты на Kaggle T4.
 Публичный Kaggle notebook пока не опубликован. После Save & Run All его ссылку
 нужно внести сюда и в [SUBMISSION.md](SUBMISSION.md).
@@ -49,9 +52,11 @@ SM75-компиляция; они не заменяют обучение и те
   большие тензоры, сохраняемые autograd внутри decoder-слоёв, в pinned CPU RAM
   через отдельный stream и заранее возвращает их на GPU для backward.
   Host slabs переиспользуются после освобождения графа и завершения копий.
-  В поддерживаемом streamed-head вызове до 4×512 токенов этот перенос
-  отключён: экономия памяти на head используется для resident decoder.
-  Это собственная реализация при прежних флагах Trainer.
+  Это собственная реализация при прежних флагах Trainer. Отказ от offload
+  остаётся отдельным экспериментом в истории, а не production-политикой.
+- [solution/rotary.py](solution/rotary.py) объединяет FP32 RoPE и его входной
+  backward на T4. Сохраняет output strides и отдельные FP32 округления;
+  неподдерживаемые вызовы передаются исходной функции Qwen.
 - [solution/mlp_padding.py](solution/mlp_padding.py) отбирает наблюдаемые или
   supervised позиции для head. На T4/SM75 MLP сохраняет исходный тензор и размеры
   GEMM: packing отключён после ошибки градиентов на commit `092d9e0`.
@@ -62,7 +67,7 @@ SM75-компиляция; они не заменяют обучение и те
 - [solution/nf4_decode.py](solution/nf4_decode.py) объединяет декодирование
   double-quant scales, offset и NF4 в один собственный Triton-кернел.
 - [solution/compile_overlap.py](solution/compile_overlap.py) компилирует
-  используемые кернелы в потоке ещё до импорта Trainer и ждёт завершения
+  используемые кернелы в потоке во время загрузки модели и ждёт завершения
   перед `Trainer.train`. Warmup не запускает кернелы и не меняет RNG;
   время компиляции остаётся внутри измеряемого процесса.
 - Веса NF4 всех слоёв пока остаются на GPU. Кольцевого переноса весов и
@@ -97,6 +102,8 @@ entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`
 | `vocab_entropy_finalize_kernel` | Энтропия через partition function и первый момент |
 | `rmsnorm_row_forward_kernel` | Нормализация и масштабирование frozen FP32 RMSNorm |
 | `rmsnorm_row_backward_kernel` | Входной градиент RMSNorm с пересчётом normalized values |
+| `rotary_forward_kernel` | FP32 RoPE query/key без промежуточных rotate/multiply тензоров |
+| `rotary_backward_kernel` | Входной градиент RoPE с исходным layout и отдельными FP32 округлениями |
 | `mlp_input_grad_kernel` | FP16 GEMM с FP32 accumulation для MLP backward только на SM80+; на T4 native |
 | `vocab_argmax_tile_kernel` | Максимум и первый индекс внутри vocabulary-тайла без копии logits |
 | `vocab_argmax_finish_kernel` | Объединение максимумов в точные token predictions для accuracy |
