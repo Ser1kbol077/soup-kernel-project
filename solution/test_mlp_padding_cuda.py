@@ -1,4 +1,4 @@
-"""Actual Qwen NF4 MLP: packed token values, gradients and unchanged RNG."""
+"""Actual Qwen NF4 MLP: same-shape T4 fallback, gradients and unchanged RNG."""
 
 from importlib import metadata
 
@@ -11,8 +11,9 @@ torch = pytest.importorskip("torch")
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 5),
     reason="requires Kaggle T4",
 )
-def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch):
-    """Exercise our real wrapper and bnb projections, without model downloads."""
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch, dtype):
+    """The production T4 path must preserve the complete preceding MLP call."""
     for name, version in (("bitsandbytes", "0.50.2"), ("transformers", "5.16.1")):
         try:
             if metadata.version(name) != version:
@@ -41,6 +42,14 @@ def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch):
     patch_compact_qwen2_mlp()
     patch_cast_elided_qwen2_mlp()
     unpacked_forward = Qwen2MLP.forward
+    unpacked_calls = []
+
+    def watched_unpacked(owner, values):
+        unpacked_calls.append(values)
+        return unpacked_forward(owner, values)
+
+    # Observe the wrapper's actual fallback target, rather than only _eligible.
+    monkeypatch.setattr(Qwen2MLP, "forward", watched_unpacked)
     assert packing.patch_qwen2_mlp_padding()
 
     torch.manual_seed(743)
@@ -58,7 +67,7 @@ def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch):
         ).to(dtype=torch.float16).to("cuda")
         setattr(module, name, projection)
     module.train().requires_grad_(False)
-    hidden = torch.randn(2, 128, 1536, device="cuda", requires_grad=True)
+    hidden = torch.randn(2, 128, 1536, device="cuda", dtype=dtype, requires_grad=True)
     reference = hidden.detach().clone().requires_grad_()
     mask = torch.zeros((2, 128), device="cuda", dtype=torch.long)
     mask[0, :96], mask[1, :64] = 1, 1
@@ -67,7 +76,9 @@ def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch):
     labels[0, 100] = 5  # a supervised query outside the metric mask is retained
     targets = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
     observed = (mask != 0) | (targets != -100)
-    grad_output = torch.randn_like(hidden) * observed[..., None] * 32
+    dense_grad_output = torch.randn_like(hidden) * 32
+    grad_output = dense_grad_output * observed[..., None]
+    parameters = [(parameter, parameter.detach().clone()) for parameter in module.parameters()]
 
     # Native Linear4bit establishes compute_type_is_set on its first call;
     # compare both paths after that one-time initialization has happened.
@@ -75,28 +86,41 @@ def test_production_qwen_nf4_mlp_padding_values_gradients_and_rng(monkeypatch):
         unpacked_forward(module, hidden.detach())
     with torch.autocast("cuda", dtype=torch.float16):
         expected = unpacked_forward(module, reference)
-    expected.backward(grad_output)
-    packed_calls = []
-    original_packed_call = packing._packed_call
 
-    def watched(original, owner, values, rows):
-        packed_calls.append(rows.indices.numel())
-        return original_packed_call(original, owner, values, rows)
+    def forbidden_packed(*args, **kwargs):
+        raise AssertionError("SM75 must preserve the original MLP GEMM dimensions")
 
-    monkeypatch.setattr(packing, "_packed_call", watched)
+    monkeypatch.setattr(packing, "_packed_call", forbidden_packed)
     cpu_rng, cuda_rng = torch.get_rng_state().clone(), torch.cuda.get_rng_state().clone()
     with packing.active_mlp_rows(mask, labels) as rows:
         assert rows is not None and rows.indices.numel() == 161
-        assert packing._eligible(module, hidden, rows, bnb.nn.Linear4bit)
+        assert not packing._eligible(module, hidden, rows, bnb.nn.Linear4bit)
         with torch.autocast("cuda", dtype=torch.float16):
             actual = module(hidden)
-    assert packed_calls == [161]
+    assert len(unpacked_calls) == 1 and unpacked_calls[0] is hidden
+    assert tuple(unpacked_calls[0].shape) == (2, 128, 1536)
     assert packing._ACTIVE.get() is None
     assert torch.equal(cpu_rng, torch.get_rng_state())
     assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
-    torch.testing.assert_close(actual[observed], expected[observed], rtol=5e-3, atol=3e-4)
-    assert torch.count_nonzero(actual[~observed]) == 0
-    actual.backward(grad_output)
-    torch.testing.assert_close(hidden.grad, reference.grad, rtol=1e-2, atol=2e-4)
+    # Both calls now have identical shapes and graphs; exact agreement is
+    # required, including ordinary MLP outputs at rows excluded by the mask.
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.count_nonzero(actual[~observed]) > 0
+    expected.backward(grad_output, retain_graph=True)
+    actual.backward(grad_output, retain_graph=True)
+    torch.testing.assert_close(hidden.grad[observed], reference.grad[observed], rtol=0, atol=0)
+    torch.testing.assert_close(hidden.grad[~observed], reference.grad[~observed], rtol=0, atol=0)
     assert torch.count_nonzero(hidden.grad[~observed]) == 0
+
+    # A true fallback also keeps the Jacobian on excluded rows. The masked
+    # training VJP above alone could miss an implementation that zeroed it.
+    hidden.grad = reference.grad = None
+    expected.backward(dense_grad_output)
+    actual.backward(dense_grad_output)
+    torch.testing.assert_close(hidden.grad, reference.grad, rtol=0, atol=0)
+    assert torch.count_nonzero(hidden.grad[~observed]) > 0
+    assert torch.equal(cpu_rng, torch.get_rng_state())
+    assert torch.equal(cuda_rng, torch.cuda.get_rng_state())
     assert all(parameter.grad is None for parameter in module.parameters())
+    for parameter, saved in parameters:
+        torch.testing.assert_close(parameter, saved, rtol=0, atol=0)

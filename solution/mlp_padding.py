@@ -1,8 +1,14 @@
-"""Avoid frozen MLP work on padding without changing attention or LoRA RNG.
+"""Select active token rows, with a same-shape MLP fallback on NVIDIA T4.
 
 The decoder keeps its original batch layout and attention mask. Only the
 token-wise, dropout-free frozen MLP is gathered and scattered. Positions used
 by supervised loss are retained even if their attention mask is zero.
+
+T4 testing of 256 versus 161 token rows found input-gradient differences above
+the required tolerance. Gather/scatter is exact, but changing the FP16 GEMM
+shape is not established as numerically safe. On SM75 the wrapper therefore
+calls the preceding MLP implementation with the original tensor and shape.
+Active-row metadata remains available to the independently chunked LM head.
 """
 
 from contextlib import contextmanager
@@ -60,6 +66,10 @@ def _eligible(module, hidden, rows, linear4bit_type=None):
             or hasattr(module, "_hf_hook")
             or module._forward_hooks or module._forward_pre_hooks):
         return False
+    # Preserve the original GEMM dimensions and branch-rounding path on T4.
+    # This is a production fallback, not a relaxed correctness threshold.
+    if torch.cuda.get_device_capability(hidden.device) == (7, 5):
+        return False
     for name, shape in (("gate_proj", (1536, 8960)), ("up_proj", (1536, 8960)),
                         ("down_proj", (8960, 1536))):
         projection = getattr(module, name, None)
@@ -75,8 +85,20 @@ def _eligible(module, hidden, rows, linear4bit_type=None):
     return True
 
 
+def _make_forward(original, cls, linear4bit_type):
+    @wraps(original)
+    def forward(self, hidden_states):
+        rows = _ACTIVE.get()
+        if type(self) is not cls or not _eligible(self, hidden_states, rows, linear4bit_type):
+            return original(self, hidden_states)
+        return _packed_call(original, self, hidden_states, rows)
+
+    forward._soup_mlp_padding_patch = True
+    return forward
+
+
 def patch_qwen2_mlp_padding():
-    """Install after existing MLP optimizations, leaving unrelated calls native."""
+    """Install after existing MLP optimizations; SM75 keeps their original shape."""
     from transformers.models.qwen2 import modeling_qwen2
     from bitsandbytes.nn import Linear4bit
 
@@ -84,14 +106,5 @@ def patch_qwen2_mlp_padding():
     original = cls.forward
     if getattr(original, "_soup_mlp_padding_patch", False):
         return False
-
-    @wraps(original)
-    def forward(self, hidden_states):
-        rows = _ACTIVE.get()
-        if type(self) is not cls or not _eligible(self, hidden_states, rows, Linear4bit):
-            return original(self, hidden_states)
-        return _packed_call(original, self, hidden_states, rows)
-
-    forward._soup_mlp_padding_patch = True
-    cls.forward = forward
+    cls.forward = _make_forward(original, cls, Linear4bit)
     return True

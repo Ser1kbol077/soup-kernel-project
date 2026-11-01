@@ -11,7 +11,7 @@ Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-ке
 а не к ускорениям ниже; SHA и полный `result.json` этого запуска не переданы.
 
 **Текущий кандидат на ветке `codex/t4-mlp-cast-elision`: ускорение потокового
-head, исключение padding из MLP/head, асинхронный offload и NF4 decode.**
+head, исключение padding из head, асинхронный offload и NF4 decode.**
 Head считает скрытый градиент при первом проходе и сохраняет его в FP32:
 повторного head GEMM в backward больше нет. Блок увеличен с 64 до 256 токенов.
 Крупные сохранённые активации копируются через side streams в повторно
@@ -49,10 +49,13 @@ SM75-компиляция; они не заменяют обучение и те
   через отдельный stream и заранее возвращает их на GPU для backward.
   Host slabs переиспользуются после освобождения графа и завершения копий.
   Это собственная реализация при прежних флагах Trainer.
-- [solution/mlp_padding.py](solution/mlp_padding.py) выполняет frozen MLP только
-  для наблюдаемых или supervised позиций. Attention и LoRA dropout сохраняют
-  исходную форму и порядок RNG. Head использует те же отобранные позиции;
+- [solution/mlp_padding.py](solution/mlp_padding.py) отбирает наблюдаемые или
+  supervised позиции для head. На T4/SM75 MLP сохраняет исходный тензор и размеры
+  GEMM: packing отключён после ошибки градиентов на commit `092d9e0`.
+  Attention и LoRA dropout сохраняют исходную форму и порядок RNG;
   causal shift выполняется до gather, отдельно для каждой строки батча.
+  Разбор, регрессионные проверки и команда диагностики:
+  [solution/MLP_PADDING_FIX.md](solution/MLP_PADDING_FIX.md).
 - [solution/nf4_decode.py](solution/nf4_decode.py) объединяет декодирование
   double-quant scales, offset и NF4 в один собственный Triton-кернел.
 - [solution/compile_overlap.py](solution/compile_overlap.py) компилирует
