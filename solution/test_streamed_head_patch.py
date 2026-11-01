@@ -56,11 +56,13 @@ class _Causal(torch.nn.Module):
         return SimpleNamespace(logits=logits, loss=terms.sum() / denom)
 
 
-def _dense_head(hidden, weight, labels, num_items_in_batch=None, attention_mask=None):
+def _dense_head(hidden, weight, labels, num_items_in_batch=None, attention_mask=None,
+                shift_labels=None):
     logits = F.linear(hidden, weight)
-    targets = F.pad(labels, (0, 1), value=-100)[..., 1:]
+    targets = (F.pad(labels, (0, 1), value=-100)[..., 1:]
+               if shift_labels is None else shift_labels)
     token_loss = F.cross_entropy(logits.flatten(0, 1), targets.flatten(),
-                                reduction="none").view_as(labels)
+                                reduction="none").view_as(targets)
     denominator = (targets != -100).sum() if num_items_in_batch is None else num_items_in_batch
     log_probs = logits.log_softmax(-1)
     return token_loss.sum() / denominator, {
@@ -96,6 +98,49 @@ def _batch():
     return {"input_ids": torch.tensor([[0, 1, 2, 3], [4, 5, 6, 0]]),
             "labels": torch.tensor([[-100, 1, 2, 3], [-100, 5, -100, -100]]),
             "attention_mask": torch.tensor([[1, 1, 1, 1], [1, 1, 1, 0]])}
+
+
+def test_active_head_skips_padding_without_changing_targets_or_hidden_gradients():
+    torch.manual_seed(311)
+    hidden = torch.randn(2, 5, 3, requires_grad=True)
+    reference = hidden.detach().clone().requires_grad_()
+    weight = torch.randn(7, 3)
+    labels = torch.tensor([[-100, 2, 3, -100, -100], [-100, 4, 5, 6, -100]])
+    mask = torch.tensor([[1, 1, 1, 0, 0], [1, 1, 1, 1, 0]])
+    seen = []
+
+    def head(*args, **kwargs):
+        seen.append((args[0].shape, kwargs.get("shift_labels")))
+        return _dense_head(*args, **kwargs)
+
+    actual, stats = patch._active_head_loss(head, hidden, weight, labels, 11, mask)
+    expected, expected_stats = _dense_head(reference, weight, labels, 11)
+    assert seen[0][0] == (1, 7, 3)
+    assert torch.equal(seen[0][1], torch.tensor([[2, 3, -100, 4, 5, 6, -100]]))
+    torch.testing.assert_close(actual, expected)
+    actual.backward()
+    expected.backward()
+    torch.testing.assert_close(hidden.grad, reference.grad)
+    torch.testing.assert_close(stats["token_loss"], expected_stats["token_loss"])
+    torch.testing.assert_close(stats["entropy"] * mask, expected_stats["entropy"] * mask)
+
+
+def test_active_head_keeps_supervised_positions_even_outside_attention_mask():
+    hidden = torch.randn(1, 5, 3, requires_grad=True)
+    weight = torch.randn(7, 3)
+    labels = torch.tensor([[-100, -100, -100, 4, -100]])
+    mask = torch.tensor([[1, 1, 0, 0, 0]])
+    seen = []
+
+    def head(*args, **kwargs):
+        seen.append(args[0].shape)
+        return _dense_head(*args, **kwargs)
+
+    actual, stats = patch._active_head_loss(head, hidden, weight, labels, None, mask)
+    expected, original = _dense_head(hidden, weight, labels)
+    assert seen == [(1, 3, 3)]
+    torch.testing.assert_close(actual, expected)
+    torch.testing.assert_close(stats["token_loss"], original["token_loss"])
 
 
 @pytest.mark.parametrize("denominator", [None, 11, torch.tensor(9)])

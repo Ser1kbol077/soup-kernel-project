@@ -74,12 +74,84 @@ def test_saved_tensors_do_not_include_dense_logits_and_repeated_backward_works()
     with torch.autograd.graph.saved_tensors_hooks(pack, lambda tensor: tensor):
         loss, _ = linear_head_loss(hidden, weight, labels, chunk_rows=3)
     assert (14, 37) not in saved and (2, 7, 37) not in saved
-    assert (3, 37) not in saved  # even a chunk must be recomputed
+    assert (3, 37) not in saved
+    assert (37, 9) not in saved  # the frozen head is not retained by autograd
     loss.backward(retain_graph=True)
     first = hidden.grad.clone()
     hidden.grad = None
     loss.backward()
     torch.testing.assert_close(hidden.grad, first, rtol=0, atol=0)
+
+
+def test_backward_uses_precomputed_vjp_without_another_head_gemm(monkeypatch):
+    from solution.streamed_head import linear_head_loss
+
+    hidden = torch.randn(2, 7, 9, requires_grad=True)
+    weight = torch.randn(37, 9)
+    labels = torch.randint(37, (2, 7))
+    native_mm = torch.mm
+    calls = []
+
+    def counted(first, second, *args, **kwargs):
+        calls.append((tuple(first.shape), tuple(second.shape)))
+        return native_mm(first, second, *args, **kwargs)
+
+    monkeypatch.setattr(torch, "mm", counted)
+    loss, _ = linear_head_loss(hidden, weight, labels, chunk_rows=5)
+    assert len(calls) == 6  # three chunks: head GEMM + hidden VJP each
+    forward_calls = list(calls)
+    loss.backward()
+    assert calls == forward_calls
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+@pytest.mark.parametrize("scale", [1.0, 128.0, 65536.0])
+def test_precomputed_vjp_matches_native_at_training_loss_scales(dtype, scale):
+    from solution.streamed_head import linear_head_loss
+
+    torch.manual_seed(611)
+    hidden = (torch.randn(2, 7, 32) * 0.1).to(dtype).requires_grad_()
+    native = hidden.detach().clone().requires_grad_()
+    weight = (torch.randn(4103, 32) * 0.025).to(dtype)
+    labels = torch.randint(4103, (2, 7))
+    labels[:, :3] = -100
+    actual, _ = linear_head_loss(hidden, weight, labels, chunk_rows=5)
+    expected, *_ = _reference(native, weight, labels)
+    torch.testing.assert_close(actual, expected, rtol=2e-6, atol=2e-6)
+    actual.backward(torch.tensor(scale))
+    expected.backward(torch.tensor(scale))
+    peak = native.grad.abs().max().float()
+    # The precomputed VJP moves the FP16 rounding relative to GradScaler.
+    # Bound the normwise error tightly instead of asserting bit equality.
+    error = (hidden.grad.float() - native.grad.float()).abs().max()
+    assert error <= peak * (0.002 if dtype == torch.float16 else 3e-6) + 1e-7
+    assert torch.count_nonzero(hidden.grad[:, :2]) == 0
+
+
+@pytest.mark.parametrize("scale", [float("inf"), float("nan")])
+def test_nonfinite_upstream_cannot_turn_into_a_finite_parameter_update(scale):
+    from solution.streamed_head import linear_head_loss
+
+    hidden = torch.randn(1, 4, 5, requires_grad=True)
+    weight = torch.randn(13, 5)
+    labels = torch.tensor([[-100, 1, -100, 4]])
+    loss, _ = linear_head_loss(hidden, weight, labels, chunk_rows=2)
+    loss.backward(torch.tensor(scale))
+    assert not torch.isfinite(hidden.grad[:, [0, 2]]).any()
+    assert torch.count_nonzero(hidden.grad[:, [1, 3]]) == 0
+
+
+def test_native_logits_gradient_overflow_remains_visible_after_vjp_cancellation():
+    from solution.streamed_head import linear_head_loss
+
+    # A tiny head would make the final VJP finite even though the scaled FP16
+    # logits gradient overflows. GradScaler must still reject that update.
+    hidden = torch.zeros(1, 2, 3, dtype=torch.float16, requires_grad=True)
+    weight = torch.full((7, 3), 1e-5, dtype=torch.float16)
+    loss, _ = linear_head_loss(hidden, weight, torch.tensor([[-100, 3]]))
+    loss.backward(torch.tensor(1e8))
+    assert not torch.isfinite(hidden.grad[:, 0]).any()
+    assert torch.count_nonzero(hidden.grad[:, 1]) == 0
 
 
 def test_noncontiguous_hidden_and_first_index_ties():
@@ -106,8 +178,8 @@ def test_rejects_trainable_head_instead_of_silently_dropping_weight_gradients():
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires Kaggle T4")
 @pytest.mark.parametrize("vocab", [4103, 151936])
-@pytest.mark.parametrize("scale", [1.0, 65536.0])
-def test_cuda_autocast_forward_metrics_and_grad_scaler_boundary(vocab, scale):
+@pytest.mark.parametrize("scale", [1.0, 128.0, 65536.0])
+def test_cuda_autocast_forward_metrics_and_precomputed_vjp(vocab, scale):
     pytest.importorskip("triton")
     from solution.streamed_head import linear_head_loss
 

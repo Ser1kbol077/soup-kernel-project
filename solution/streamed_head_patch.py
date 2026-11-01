@@ -95,6 +95,37 @@ def _eligible_forward(model, request, labels, past_key_values, inputs_embeds,
     )
 
 
+def _active_head_loss(head_loss, hidden, weight, labels, denominator, attention_mask, rows=None):
+    """Skip head rows neither observed by metrics nor used by supervised loss.
+
+    Shift labels before gathering: concatenated batch rows must never acquire
+    next-token targets from their neighbours. Decoder/dropout execution is
+    unchanged, so this introduces no extra RNG draws or attention changes.
+    """
+    if not isinstance(attention_mask, torch.Tensor) or attention_mask.shape != labels.shape:
+        return head_loss(hidden, weight, labels, num_items_in_batch=denominator,
+                         attention_mask=attention_mask)
+    targets = torch.nn.functional.pad(labels, (0, 1), value=-100)[..., 1:]
+    if rows is None:
+        observed = (attention_mask != 0) | (targets != -100)
+        indices = observed.reshape(-1).nonzero(as_tuple=False).flatten()
+    else:
+        indices = rows.indices
+    if indices.numel() == 0 or indices.numel() == labels.numel():
+        return head_loss(hidden, weight, labels, num_items_in_batch=denominator,
+                         attention_mask=attention_mask)
+    packed = hidden.reshape(-1, hidden.shape[-1]).index_select(0, indices).unsqueeze(0)
+    packed_targets = targets.reshape(-1).index_select(0, indices).unsqueeze(0)
+    loss, compact = head_loss(packed, weight, None, num_items_in_batch=denominator,
+                              shift_labels=packed_targets)
+    stats = {}
+    for name, value in compact.items():
+        full = value.new_zeros(labels.numel())
+        full.index_copy_(0, indices, value.reshape(-1))
+        stats[name] = full.view_as(labels)
+    return loss, stats
+
+
 def _make_forward(original, head_loss, output_type):
     @wraps(original)
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
@@ -107,14 +138,17 @@ def _make_forward(original, head_loss, output_type):
                             position_ids=position_ids, past_key_values=past_key_values,
                             inputs_embeds=inputs_embeds, labels=labels,
                             use_cache=use_cache, logits_to_keep=logits_to_keep, **kwargs)
-        decoder = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                             position_ids=position_ids, past_key_values=past_key_values,
-                             inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
-        loss, stats = head_loss(
-            decoder.last_hidden_state, self.lm_head.weight, labels,
-            num_items_in_batch=kwargs.get("num_items_in_batch"),
-            attention_mask=attention_mask,
-        )
+        from .mlp_padding import active_mlp_rows
+
+        with active_mlp_rows(attention_mask, labels,
+                             enabled=not getattr(self.model, "gradient_checkpointing", False)) as rows:
+            decoder = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                 position_ids=position_ids, past_key_values=past_key_values,
+                                 inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+            loss, stats = _active_head_loss(
+                head_loss, decoder.last_hidden_state, self.lm_head.weight, labels,
+                kwargs.get("num_items_in_batch"), attention_mask, rows,
+            )
         request.stats = stats
         return output_type(loss=loss, logits=None,
                            past_key_values=getattr(decoder, "past_key_values", None),

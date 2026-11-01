@@ -42,6 +42,98 @@ def test_storage_identity_excludes_nonzero_offset_parameter_views():
     assert offload._storage_key(view) in hooks._resident
 
 
+def test_host_slab_reuse_waits_for_generation_lease_and_preserves_dense_strides(monkeypatch):
+    import gc
+
+    allocations = []
+
+    def allocate(nbytes):
+        allocations.append(nbytes)
+        return torch.empty(nbytes, dtype=torch.uint8)
+
+    monkeypatch.setattr(offload, "_allocate_host", allocate)
+    pool = offload._PinnedPool(block_bytes=1024)
+    source = torch.randn(8, 4).t()
+    first = pool.acquire()
+    first_view = first.allocate(source)
+    first_view.copy_(source)
+    assert first_view.stride() == source.stride()
+    second = pool.acquire()
+    second_view = second.allocate(source)
+    assert first_view.data_ptr() != second_view.data_ptr()
+    second_view.zero_()
+    torch.testing.assert_close(first_view, source, rtol=0, atol=0)
+    first_pointer = first_view.data_ptr()
+    del first
+    gc.collect()
+    third = pool.acquire()
+    assert third.allocate(source).data_ptr() == first_pointer
+    assert allocations == [1024, 1024]
+
+
+def test_fragmented_host_blocks_consolidate_only_at_an_idle_graph_boundary(monkeypatch):
+    import gc
+
+    monkeypatch.setattr(offload, "_allocate_host", lambda n: torch.empty(n, dtype=torch.uint8))
+    pool = offload._PinnedPool(block_bytes=1024)
+    first = pool.acquire()
+    source = torch.randn(192)
+    views = [first.allocate(source) for _ in range(3)]
+    for index, view in enumerate(views):
+        view.fill_(index)
+    assert len(first.arena.blocks) == 3
+    arena = first.arena
+    del first
+    gc.collect()
+    next_generation = pool.acquire()
+    assert next_generation.arena is arena
+    assert len(arena.blocks) == 1 and arena.blocks[0].numel() == 4096
+    # The consolidated capacity fits all the old requests without growing.
+    for _ in range(3):
+        next_generation.allocate(source)
+    assert len(arena.blocks) == 1
+
+
+def test_idle_host_arena_waits_only_for_outstanding_copies_and_never_reuses_a_live_lease():
+    import gc
+
+    class Event:
+        def __init__(self, done):
+            self.done, self.queries, self.waits = done, 0, 0
+
+        def query(self):
+            self.queries += 1
+            return self.done
+
+        def synchronize(self):
+            self.waits += 1
+            self.done = True
+
+    pool = offload._PinnedPool(block_bytes=1024)
+    first = pool.acquire()
+    arena = first.arena
+    complete, pending = Event(True), Event(False)
+    arena.record_event(complete)
+    arena.record_event(pending)
+    arena.record_event(pending)  # batch events are deduplicated
+    second = pool.acquire()
+    assert second.arena is not arena
+    assert complete.queries == pending.queries == 0
+    assert complete.waits == pending.waits == 0
+    del first
+    gc.collect()
+    reused = pool.acquire()
+    assert reused.arena is arena
+    assert complete.queries == pending.queries == 1
+    assert complete.waits == 0 and pending.waits == 1
+    assert not arena.events
+    del reused
+    gc.collect()
+    again = pool.acquire()
+    assert again.arena is arena
+    assert pending.waits == 1  # no stale wait on the next normal generation
+
+
 def test_installer_is_idempotent_and_cpu_eval_fallback_is_unchanged():
     class Decoder(torch.nn.Module):
         def __init__(self, config):
@@ -135,6 +227,83 @@ def test_cuda_copy_event_orders_restore_on_a_different_stream():
         result = restored.square()
     torch.cuda.current_stream().wait_stream(other)
     torch.testing.assert_close(result, source.square(), rtol=0, atol=0)
+
+
+@requires_cuda
+def test_cuda_layer_batch_releases_source_refs_and_restores_exact_snapshot():
+    source = torch.randn(256, 128, device="cuda")
+    expected = source.clone()
+    step = offload._Step(source.device)
+    batch = offload._LayerBatch(step, 0)
+    hooks = offload.SavedTensorOffload(torch.nn.Module(), min_bytes=1, batch=batch)
+    payload = hooks.pack(source)
+    assert payload.ready is None and batch.sources
+    batch.flush()
+    assert payload.ready is batch.ready
+    del source
+    replacement = torch.empty_like(expected).fill_(17)
+    step.drain(2, finish=True)
+    assert not batch.sources and not step.pending
+    torch.testing.assert_close(hooks.unpack(payload), expected, rtol=0, atol=0)
+    assert torch.all(replacement == 17)
+
+
+@requires_cuda
+def test_cuda_batched_copies_prefetch_previous_layer_and_preserve_all_gradients():
+    torch.manual_seed(113)
+    first = torch.nn.Linear(128, 128, device="cuda")
+    second = torch.nn.Linear(128, 128, device="cuda")
+    x = torch.randn(64, 128, device="cuda", requires_grad=True)
+    reference = second(first(x).sin()).sin().square().mean()
+    leaves = (x, first.weight, first.bias, second.weight, second.bias)
+    expected = torch.autograd.grad(reference, leaves)
+    step = offload._Step(x.device)
+    batch0, batch1 = offload._LayerBatch(step, 0), offload._LayerBatch(step, 1)
+    hooks0 = offload.SavedTensorOffload(first, min_bytes=1, batch=batch0)
+    hooks1 = offload.SavedTensorOffload(second, min_bytes=1, batch=batch1)
+    with torch.autograd.graph.saved_tensors_hooks(hooks0.pack, hooks0.unpack):
+        hidden = first(x).sin()
+    batch0.flush()
+    with torch.autograd.graph.saved_tensors_hooks(hooks1.pack, hooks1.unpack):
+        output = second(hidden).sin()
+    batch1.flush()
+    step.drain(2, finish=True)
+    before = offload.STATS["prefetched_layers"]
+    got = torch.autograd.grad(output.square().mean(), leaves, retain_graph=True)
+    assert offload.STATS["prefetched_layers"] > before
+    repeated = torch.autograd.grad(output.square().mean(), x)[0]
+    for actual, wanted in zip(got, expected):
+        torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+    torch.testing.assert_close(repeated, expected[0], rtol=0, atol=0)
+
+
+@requires_cuda
+def test_cuda_host_pool_reuses_allocations_after_backward_but_not_for_a_live_graph():
+    import gc
+
+    module = torch.nn.Linear(128, 128, device="cuda")
+    pool = offload._PinnedPool(block_bytes=1 << 20)
+
+    def build(x):
+        hooks = offload.SavedTensorOffload(module, min_bytes=1, pool=pool)
+        with torch.autograd.graph.saved_tensors_hooks(hooks.pack, hooks.unpack):
+            return module(x).sin().square().mean()
+
+    x = torch.randn(64, 128, device="cuda", requires_grad=True)
+    first = build(x)
+    allocation_count = offload.STATS["host_allocations"]
+    expected = torch.autograd.grad(module(x).sin().square().mean(), x)[0]
+    first.backward()
+    torch.testing.assert_close(x.grad, expected, rtol=0, atol=0)
+    del first
+    gc.collect()
+    second = build(x)
+    assert offload.STATS["host_allocations"] == allocation_count
+    # The live second graph leases its slab; a third graph must use another.
+    third = build(x * 2)
+    assert offload.STATS["host_allocations"] > allocation_count
+    torch.autograd.grad(second, x)
+    torch.autograd.grad(third, x)
 
 
 @requires_cuda
