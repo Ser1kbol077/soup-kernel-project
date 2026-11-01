@@ -158,6 +158,77 @@ def test_installer_is_idempotent_and_cpu_eval_fallback_is_unchanged():
     assert not Decoder(config)._soup_activation_offload_target
 
 
+def test_resident_decoder_context_restores_nested_disabled_and_failed_scopes():
+    assert not offload._RESIDENT_ACTIVATIONS.get()
+    with offload.resident_decoder_activations():
+        assert offload._RESIDENT_ACTIVATIONS.get()
+        with offload.resident_decoder_activations(enabled=False):
+            assert not offload._RESIDENT_ACTIVATIONS.get()
+            with offload.resident_decoder_activations():
+                assert offload._RESIDENT_ACTIVATIONS.get()
+            assert not offload._RESIDENT_ACTIVATIONS.get()
+        assert offload._RESIDENT_ACTIVATIONS.get()
+        with pytest.raises(RuntimeError, match="decoder failed"):
+            with offload.resident_decoder_activations(enabled=False):
+                assert not offload._RESIDENT_ACTIVATIONS.get()
+                raise RuntimeError("decoder failed")
+        assert offload._RESIDENT_ACTIVATIONS.get()
+    assert not offload._RESIDENT_ACTIVATIONS.get()
+
+
+def test_resident_decoder_bypasses_offload_and_preserves_arguments_dropout_and_gradients(monkeypatch):
+    calls = []
+
+    class Decoder(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.5, dtype=torch.float64))
+            self.dropout = torch.nn.Dropout(0.25)
+
+        def forward(self, hidden_states, residual, *, multiplier):
+            calls.append((hidden_states, residual, multiplier))
+            return (self.dropout(hidden_states.sin()) + residual) * self.scale * multiplier
+
+    config = SimpleNamespace(model_type="qwen2", vocab_size=151936, hidden_size=1536,
+                             intermediate_size=8960, num_hidden_layers=28)
+    original = Decoder.forward
+    assert offload.patch_qwen2_activation_offload(SimpleNamespace(Qwen2DecoderLayer=Decoder))
+    layer = Decoder(config)
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("resident decoder must bypass all offload setup")
+
+    for name in ("_supported_call", "_Step", "_LayerBatch", "SavedTensorOffload",
+                 "_PinnedPool", "_allocate_host"):
+        monkeypatch.setattr(offload, name, forbidden)
+    monkeypatch.setattr(torch.autograd.graph, "saved_tensors_hooks", forbidden)
+    existing_step = object()
+    monkeypatch.setitem(offload._FORWARD, "step", existing_step)
+    before_stats = dict(offload.STATS)
+    torch.manual_seed(127)
+    hidden = torch.randn(2, 3, 1536, dtype=torch.float64, requires_grad=True)
+    reference = hidden.detach().clone().requires_grad_()
+    residual = torch.randn_like(hidden)
+    rng = torch.get_rng_state().clone()
+    expected = original(layer, reference, residual, multiplier=2)
+    expected_grad = torch.autograd.grad(expected.square().mean(), (reference, layer.scale))
+    expected_rng = torch.get_rng_state().clone()
+    torch.set_rng_state(rng)
+    with offload.resident_decoder_activations():
+        actual = layer(hidden, residual, multiplier=2)
+    actual_grad = torch.autograd.grad(actual.square().mean(), (hidden, layer.scale))
+
+    assert calls[-1][0] is hidden and calls[-1][1] is residual and calls[-1][2] == 2
+    assert offload._FORWARD["step"] is existing_step
+    assert offload.STATS == before_stats
+    assert torch.equal(torch.get_rng_state(), expected_rng)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, wanted in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+    assert layer.scale.grad is None
+    assert not offload._RESIDENT_ACTIVATIONS.get()
+
+
 @requires_cuda
 @pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
 @pytest.mark.parametrize("transpose", [False, True])
@@ -337,3 +408,52 @@ def test_t4_decoder_wrapper_activates_and_preserves_parameter_and_input_gradient
     with torch.no_grad():
         patched(x)
     assert offload.STATS["offloaded_tensors"] == before
+
+
+@requires_cuda
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_t4_resident_decoder_preserves_original_values_gradients_and_dropout_rng(dtype):
+    if torch.cuda.get_device_capability() != (7, 5):
+        pytest.skip("production wrapper targets T4")
+
+    class Decoder(torch.nn.Module):
+        def __init__(self, config):
+            super().__init__()
+            self.scale = torch.nn.Parameter(torch.tensor(1.5, device="cuda", dtype=dtype))
+            self.dropout = torch.nn.Dropout(0.25)
+
+        def forward(self, hidden_states):
+            return self.dropout(hidden_states.sin()) * self.scale
+
+    config = SimpleNamespace(model_type="qwen2", vocab_size=151936, hidden_size=1536,
+                             intermediate_size=8960, num_hidden_layers=28)
+    original = Decoder.forward
+    assert offload.patch_qwen2_activation_offload(SimpleNamespace(Qwen2DecoderLayer=Decoder))
+    layer = Decoder(config)
+    torch.manual_seed(131)
+    hidden = torch.randn(4, 64, 1536, device="cuda", dtype=dtype, requires_grad=True)
+    reference = hidden.detach().clone().requires_grad_()
+    upstream = torch.randn_like(hidden) / hidden.numel()
+    assert offload._supported_call(layer, hidden)
+    cpu_rng = torch.get_rng_state().clone()
+    cuda_rng = torch.cuda.get_rng_state().clone()
+    expected = original(layer, reference)
+    expected_grad = torch.autograd.grad(expected, (reference, layer.scale), upstream)
+    expected_cpu_rng = torch.get_rng_state().clone()
+    expected_cuda_rng = torch.cuda.get_rng_state().clone()
+    torch.set_rng_state(cpu_rng)
+    torch.cuda.set_rng_state(cuda_rng)
+    before_stats = dict(offload.STATS)
+    with offload.resident_decoder_activations():
+        actual = layer(hidden)
+    actual_grad = torch.autograd.grad(actual, (hidden, layer.scale), upstream)
+
+    assert offload.STATS == before_stats
+    assert torch.equal(torch.get_rng_state(), expected_cpu_rng)
+    assert torch.equal(torch.cuda.get_rng_state(), expected_cuda_rng)
+    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    for got, wanted in zip(actual_grad, expected_grad):
+        torch.testing.assert_close(got, wanted, rtol=0, atol=0)
+    assert layer.scale.grad is None
+    torch.testing.assert_close(layer.scale, torch.full_like(layer.scale, 1.5), rtol=0, atol=0)
+    assert not offload._RESIDENT_ACTIVATIONS.get()

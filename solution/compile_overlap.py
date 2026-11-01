@@ -27,7 +27,7 @@ def _compile_specs(torch, mock_type):
     modulo four change pointer alignment, so compile those useful variants too.
     The mock pointer addresses are only specialization metadata; none is read.
     """
-    from . import nf4_decode, rmsnorm, streamed_head, vocab_ops
+    from . import nf4_decode, rmsnorm, streamed_head, swiglu, vocab_ops
 
     class Pointer(mock_type):
         def __init__(self, dtype, byte_offset=0):
@@ -65,6 +65,24 @@ def _compile_specs(torch, mock_type):
            (ptr(f32), ptr(f32), ptr(f32), ptr(f32), 1536, 1e-6, 2048), (1,), options)
     yield ("rmsnorm_backward", rmsnorm.rmsnorm_row_backward_kernel,
            (ptr(f32), ptr(f32), ptr(f32), ptr(f32), ptr(f32), 1536, 2048), (1,), options)
+
+    # The example/compact wrappers use FP32 SwiGLU, while the eligible
+    # cast-elided MLP uses FP16. The compact-cache fallback has FP32 gradients
+    # and outputs but FP16 saved gate/up pointers in backward.
+    # These are the supplied example kernels, still excluded from own share.
+    # Their actual launch sites pass no options: preserve Triton's defaults,
+    # including FP fusion, rather than inheriting the head's stricter options.
+    elements = 8960
+    grid = ((elements + swiglu.BLOCK - 1) // swiglu.BLOCK,)
+    for suffix, dtype in (("fp32", f32), ("fp16", f16)):
+        yield (f"example_swiglu_forward_{suffix}", swiglu.example_swiglu_fwd_kernel,
+               (ptr(dtype), ptr(dtype), ptr(dtype), elements, swiglu.BLOCK), grid, {})
+    for suffix, grad_dtype, cache_dtype in (("fp32", f32, f32),
+                                           ("compact", f32, f16),
+                                           ("fp16", f16, f16)):
+        yield (f"example_swiglu_backward_{suffix}", swiglu.example_swiglu_bwd_kernel,
+               (ptr(grad_dtype), ptr(cache_dtype), ptr(cache_dtype),
+                ptr(grad_dtype), ptr(grad_dtype), elements, swiglu.BLOCK), grid, {})
 
 
 def _build_kernels():
@@ -143,12 +161,16 @@ def start_compile_overlap(trainer_cls=None):
         if (not torch.cuda.is_available() or torch.cuda.device_count() != 1
                 or torch.cuda.get_device_capability(0) != (7, 5)):
             return False
+        # Trainer is lazy-loaded and can import substantial dependencies.
+        # Compile during that work as well as during later model loading.
+        # _start_worker registers the exit join even if Trainer import fails.
+        started = _start_worker(_build_kernels)
         if trainer_cls is None:
             from transformers import Trainer
 
             trainer_cls = Trainer
         _install_join(trainer_cls)
-        return _start_worker(_build_kernels)
+        return started
     except Exception as error:
         STATE["errors"].append({"kernel": "setup", "error": repr(error)})
         return False

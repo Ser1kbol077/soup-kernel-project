@@ -8,6 +8,8 @@ No input values, dtypes, Trainer flags, or allocator options are changed.
 """
 
 from collections import deque
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 import weakref
@@ -20,6 +22,17 @@ MAX_LAYER_BYTES = 256 << 20
 HOST_BLOCK_BYTES = 16 << 20
 STATS = {"offloaded_tensors": 0, "offloaded_bytes": 0, "restored_tensors": 0,
          "host_allocations": 0, "host_allocated_bytes": 0, "prefetched_layers": 0}
+_RESIDENT_ACTIVATIONS = ContextVar("soup_resident_decoder_activations", default=False)
+
+
+@contextmanager
+def resident_decoder_activations(enabled=True):
+    """Keep the original decoder graph on GPU within a bounded caller scope."""
+    token = _RESIDENT_ACTIVATIONS.set(enabled)
+    try:
+        yield
+    finally:
+        _RESIDENT_ACTIVATIONS.reset(token)
 
 
 def _allocate_host(nbytes):
@@ -366,7 +379,7 @@ def patch_qwen2_activation_offload(modeling_qwen2=None):
 
     @wraps(original_forward)
     def forward(self, hidden_states, *args, **kwargs):
-        if not _supported_call(self, hidden_states):
+        if _RESIDENT_ACTIVATIONS.get() or not _supported_call(self, hidden_states):
             return original_forward(self, hidden_states, *args, **kwargs)
         index = self._soup_offload_index
         # An isolated layer (including tests) owns its own short-lived step.

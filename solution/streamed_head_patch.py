@@ -126,6 +126,14 @@ def _active_head_loss(head_loss, hidden, weight, labels, denominator, attention_
     return loss, stats
 
 
+def _resident_decoder_call(model, labels):
+    # The bounded head removes vocabulary-sized retained activations. Spend
+    # that memory saving on the fixed task's decoder instead of PCIe copies.
+    # Larger calls retain the existing offload policy until measured on T4.
+    return (1 <= labels.shape[0] <= 4 and 1 <= labels.shape[1] <= 512
+            and not getattr(model.model, "gradient_checkpointing", False))
+
+
 def _make_forward(original, head_loss, output_type):
     @wraps(original)
     def forward(self, input_ids=None, attention_mask=None, position_ids=None,
@@ -139,12 +147,14 @@ def _make_forward(original, head_loss, output_type):
                             inputs_embeds=inputs_embeds, labels=labels,
                             use_cache=use_cache, logits_to_keep=logits_to_keep, **kwargs)
         from .mlp_padding import active_mlp_rows
+        from .activation_offload import resident_decoder_activations
 
         with active_mlp_rows(attention_mask, labels,
                              enabled=not getattr(self.model, "gradient_checkpointing", False)) as rows:
-            decoder = self.model(input_ids=input_ids, attention_mask=attention_mask,
-                                 position_ids=position_ids, past_key_values=past_key_values,
-                                 inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
+            with resident_decoder_activations(enabled=_resident_decoder_call(self, labels)):
+                decoder = self.model(input_ids=input_ids, attention_mask=attention_mask,
+                                     position_ids=position_ids, past_key_values=past_key_values,
+                                     inputs_embeds=inputs_embeds, use_cache=use_cache, **kwargs)
             loss, stats = _active_head_loss(
                 head_loss, decoder.last_hidden_state, self.lm_head.weight, labels,
                 kwargs.get("num_items_in_batch"), attention_mask, rows,

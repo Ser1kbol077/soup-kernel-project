@@ -1,8 +1,9 @@
 """Compilation worker lifecycle and warmup specialization descriptions."""
 
 import inspect
+import sys
 import threading
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -85,6 +86,55 @@ def test_join_without_started_worker_is_a_noop():
     assert not overlap.join_compile_overlap()
 
 
+@pytest.mark.parametrize("import_fails", [False, True])
+def test_worker_starts_before_lazy_trainer_import_and_remains_joinable(
+    monkeypatch, isolated_state, import_fails
+):
+    entered, finished = threading.Event(), threading.Event()
+    order = []
+
+    def worker():
+        order.append("compile")
+        entered.set()
+        finished.set()
+
+    class Trainer:
+        def train(self):
+            assert finished.is_set()
+            return "trained"
+
+    class LazyTransformers(ModuleType):
+        def __getattr__(self, name):
+            if name != "Trainer":
+                raise AttributeError(name)
+            assert entered.wait(timeout=2), "compilation must start before Trainer import"
+            assert isolated_state["started"]
+            assert isolated_state["exit_callbacks"] == [overlap.join_compile_overlap]
+            order.append("trainer_import")
+            if import_fails:
+                raise RuntimeError("Trainer unavailable")
+            return Trainer
+
+    cuda = SimpleNamespace(is_available=lambda: True, device_count=lambda: 1,
+                           get_device_capability=lambda device: (7, 5))
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=cuda))
+    monkeypatch.setitem(sys.modules, "transformers", LazyTransformers("transformers"))
+    monkeypatch.setattr(overlap, "_build_kernels", worker)
+    assert overlap.start_compile_overlap() is (not import_fails)
+    assert order[:2] == ["compile", "trainer_import"]
+    assert isolated_state["started"] and not isolated_state["joined"]
+    if import_fails:
+        assert isolated_state["errors"] == [{"kernel": "setup", "error": "RuntimeError('Trainer unavailable')"}]
+        isolated_state["exit_callbacks"][0]()
+    else:
+        installed = Trainer.train
+        assert not overlap.start_compile_overlap(Trainer)
+        assert Trainer.train is installed
+        assert Trainer().train() == "trained"
+        assert isolated_state["errors"] == []
+    assert isolated_state["joined"]
+
+
 def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkeypatch):
     import solution
 
@@ -98,8 +148,10 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
     norm = SimpleNamespace(rmsnorm_row_forward_kernel=kernel("norm_fwd"),
                            rmsnorm_row_backward_kernel=kernel("norm_bwd"))
     vocab = SimpleNamespace(VOCAB_TILE=4096, vocab_ce_backward_kernel=kernel("gradient"))
+    swiglu = SimpleNamespace(BLOCK=1024, example_swiglu_fwd_kernel=kernel("swiglu_fwd"),
+                             example_swiglu_bwd_kernel=kernel("swiglu_bwd"))
     for name, module in (("nf4_decode", nf4), ("rmsnorm", norm),
-                         ("streamed_head", head), ("vocab_ops", vocab)):
+                         ("streamed_head", head), ("swiglu", swiglu), ("vocab_ops", vocab)):
         monkeypatch.setattr(solution, name, module, raising=False)
     dtypes = SimpleNamespace(float16="half", float32="float", int32="int", int64="long", uint8="byte")
 
@@ -108,7 +160,7 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
             self.dtype = dtype
 
     specs = list(overlap._compile_specs(dtypes, Mock))
-    assert len(specs) == 15
+    assert len(specs) == 20
     tile_specs = [spec for spec in specs if spec[1].name == "tile"]
     merge_specs = [spec for spec in specs if spec[1].name == "merge"]
     assert [spec[0] for spec in tile_specs] == ["head_tile_tail0", "head_tile_tail1",
@@ -117,8 +169,19 @@ def test_specifications_cover_tail_pointer_alignment_without_real_tensors(monkey
     assert [spec[2][3].data_ptr() % 16 for spec in tile_specs] == [0, 8, 0, 8]
     # LogSum lies one row-array past RowMax: every size modulo four matters.
     assert [spec[2][8].data_ptr() % 16 for spec in merge_specs] == [0, 4, 8, 12]
-    for _, _, _, _, options in specs:
-        assert options == {"num_warps": 4, "enable_fp_fusion": False}
+    for name, _, _, _, options in specs:
+        assert options == ({} if name.startswith("example_swiglu") else
+                           {"num_warps": 4, "enable_fp_fusion": False})
+    pointwise = [(name, kernel.name, tuple(arg.dtype for arg in args[:-2]), args[-2:], grid)
+                 for name, kernel, args, grid, _ in specs if name.startswith("example_swiglu")]
+    assert pointwise == [
+        ("example_swiglu_forward_fp32", "swiglu_fwd", ("float", "float", "float"), (8960, 1024), (9,)),
+        ("example_swiglu_forward_fp16", "swiglu_fwd", ("half", "half", "half"), (8960, 1024), (9,)),
+        ("example_swiglu_backward_fp32", "swiglu_bwd", ("float",) * 5, (8960, 1024), (9,)),
+        ("example_swiglu_backward_compact", "swiglu_bwd", ("float", "half", "half", "float", "float"),
+         (8960, 1024), (9,)),
+        ("example_swiglu_backward_fp16", "swiglu_bwd", ("half",) * 5, (8960, 1024), (9,)),
+    ]
 
 
 def test_cpu_setup_does_not_install_or_start_worker(isolated_state):
