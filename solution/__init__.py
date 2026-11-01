@@ -15,6 +15,7 @@ The rules in short (the README and the task statement have the full ones):
 
 def apply():
     from .accuracy_patch import patch_sft_accuracy
+    from .activation_offload import patch_qwen2_activation_offload
     from .causal_loss import patch_qwen2_causal_loss
     from .compact_swiglu import patch_compact_qwen2_mlp
     from .mlp_backward import patch_mlp_input_grad
@@ -22,6 +23,7 @@ def apply():
     from .patches import patch_vocab_operations
     from .rmsnorm import patch_qwen2_rmsnorm
     from .swiglu import patch_qwen2_mlp
+    from .streamed_head_patch import patch_streamed_head
 
     patch_vocab_operations()
     patch_qwen2_causal_loss()
@@ -31,3 +33,5 @@ def apply():
     patch_mlp_input_grad()
     patch_cast_elided_qwen2_mlp()
     patch_sft_accuracy()
+    patch_streamed_head()
+    patch_qwen2_activation_offload()

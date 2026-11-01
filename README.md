@@ -1,6 +1,6 @@
-# Soup Kernel Challenge — Triton vocabulary reductions
+# Soup Kernel Challenge — memory-efficient training on T4
 
-Первая версия оптимизации обучения **Qwen2.5-1.5B-Instruct на Kaggle Tesla T4** для
+Оптимизация обучения **Qwen2.5-1.5B-Instruct на Kaggle Tesla T4** для
 Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-кернелы.
 
 Последний переданный командой отчёт Kaggle T4: **79.9 → 79.0 с**,
@@ -8,13 +8,17 @@ Decentrathon 6.0: **Soup 0.77.0**, PyTorch и собственные Triton-ке
 и 79 Soup-тестов; check 4 не прошёл: собственные кернелы заняли **2.5%**.
 Это результаты предыдущего запуска, не подтверждение текущего кандидата.
 
-**Текущий отдельный кандидат: `codex/t4-mlp-cast-elision`.** Он основан на
-`6908b39` (`codex/t4-strided-accuracy`), результат которого ещё ожидается.
-Новый autograd-путь убирает внутренние FP32↔FP16-копии замороженного NF4 MLP,
-сохраняя native bitsandbytes GEMM и decode, отдельное округление градиентов
-ветвей и их FP32-суммирование. Штатные SwiGLU-кернелы используются без изменений
-и не засчитываются как собственные. Детали и команды:
-[solution/MLP_CAST_CANDIDATE.md](solution/MLP_CAST_CANDIDATE.md).
+**Текущий кандидат на ветке `codex/t4-mlp-cast-elision`: потоковый LM head и
+перенос сохранённых активаций в RAM.** Главная цель — перестать хранить полные
+logits и их градиент, а большие сохранённые тензоры decoder-слоёв держать в
+закреплённой системной памяти до backward. Значения и dtype при переносе
+сохраняются. Данные, batch size/order, LoRA, optimizer и настройки Soup прежние.
+Новый путь ещё требует проверки на Kaggle T4; измеренное уменьшение памяти,
+время и прохождение всех правил пока не заявляются.
+
+Это следующий этап после устранения FP32↔FP16-копий frozen NF4 MLP
+([solution/MLP_CAST_CANDIDATE.md](solution/MLP_CAST_CANDIDATE.md)). Штатные
+SwiGLU-кернелы по-прежнему не засчитываются как собственные.
 
 Родительский эксперимент устраняет копию сдвинутых logits для accuracy:
 [solution/ACCURACY_CANDIDATE.md](solution/ACCURACY_CANDIDATE.md).
@@ -29,7 +33,26 @@ SM75-компиляция; они не заменяют обучение и те
 Публичный Kaggle notebook пока не опубликован. После Save & Run All его ссылку
 нужно внести сюда и в [SUBMISSION.md](SUBMISSION.md).
 
-## Архитектура и первая оптимизация
+## Кандидат для снижения памяти
+
+- [solution/streamed_head.py](solution/streamed_head.py) считает loss и метрики
+  ограниченными блоками вместо полной матрицы `[batch, sequence, vocabulary]`.
+  [solution/streamed_head_patch.py](solution/streamed_head_patch.py) подключает
+  этот путь к Qwen2, TRL и Soup с сохранением causal shift, token counts и rewind.
+- [solution/activation_offload.py](solution/activation_offload.py) переносит
+  большие тензоры, сохраняемые autograd внутри decoder-слоёв, в pinned CPU RAM
+  и возвращает их на GPU для backward. Это собственная реализация при прежних
+  флагах Trainer.
+- Веса NF4 всех слоёв пока остаются на GPU. Кольцевого переноса весов и
+  потокового чтения embedding/head из RAM в этом кандидате нет; **599 MiB не
+  является его обещанным результатом**. Экономия VRAM требует дополнительной RAM
+  и обмена через PCIe, поэтому время нужно измерять вместе с памятью.
+
+На Kaggle notebook сначала проверяет наличие новых модулей в скачанном commit,
+затем запускает тесты и полный benchmark с двумя повторами. В конце он выводит
+внешний peak GPU вместе с PyTorch allocated/reserved и сохраняет архив логов.
+
+## Архитектура и сохранённые оптимизации
 
 Все 24 исходных файла сверены по Git blob SHA с
 [официальным шаблоном](https://github.com/MakazhanAlpamys/soup-kernel-challenge):
@@ -41,7 +64,8 @@ Harness запускает baseline и solution в отдельных проце
 и LoRA r=16 на q/v. Transformers считает causal cross-entropy в FP32, TRL считает
 entropy/accuracy, Soup пишет per-row loss и token counts в `rewind.jsonl`.
 
-Первая оптимизация заменяет редукции по словарю из **151936** классов:
+Предыдущий путь с полными logits остаётся для fallback. Он заменяет редукции
+по словарю из **151936** классов:
 
 | Собственный кернел | Работа |
 |---|---|
@@ -94,8 +118,10 @@ gate/up проекций backward-кэш хранится в FP16 без пот�
 1. Импортировать [kaggle_t4.ipynb](kaggle_t4.ipynb) в новый Kaggle notebook.
 2. Выбрать **GPU T4 x2**, включить Internet. Все GPU-процессы используют только
    GPU 0. Перед измерениями обе GPU должны быть свободны.
-3. URL репозитория заполнен. Для разработки `COMMIT` указывает на ветку решения;
-   для итогового воспроизведения заменить его полным SHA проверяемого commit.
+3. Сначала отправить изменения в GitHub: Kaggle клонирует репозиторий, а не
+   локальные незакоммиченные файлы. URL репозитория заполнен. Для разработки
+   `COMMIT` указывает на ветку решения; для итогового воспроизведения заменить
+   его полным SHA проверяемого commit. Notebook печатает фактический SHA.
 4. Run All. `subprocess.run(check=True)` останавливает notebook при ошибках.
 5. Сохранить публичную версию с фиксированным SHA и заполнить ссылки/результаты.
 
@@ -158,7 +184,7 @@ solution-runs, делённая на `1000 * timed_loop_s` шагов 3+. Бер
 | GPU correctness на T4 | Для `6e6781b` команда сообщила 51 PASS / 2 FAIL; FP16 entropy исправлен, повторная GPU-проверка ожидается |
 | 79 Soup regression tests | Не запускалось: локально нет зависимостей |
 | Предыдущая версия, по отчёту команды | 1.084x; 12385 vs 14345 MiB; eval 2.04965 vs 2.04967 |
-| Новая версия: время / peak MiB / eval / доля | Требуется повторный T4 benchmark |
+| Потоковый head + offload: время / peak MiB / eval / доля | Требуется полный T4 benchmark с двумя повторами |
 | `6b175fb`: правила, по отчёту команды | 9/10 PASS; check 4 FAIL при 2.4%; 79 Soup tests PASS |
 | Все 10 правил | Не подтверждено |
 
